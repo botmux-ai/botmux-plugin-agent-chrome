@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# agent 侧受限网关：给 agent（在 Bash 里）取自己 session 的环境信息、
+# 并把任何 X11 操作限定到自己的窗口——避免裸 DISPLAY 绕过 broker 隔离。
+#
+# 用法：
+#   browser-session info                     # 打印自己的 DISPLAY/窗口/noVNC URL（JSON）
+#   browser-session vnc                      # 只打印 noVNC 观看链接
+#   browser-session writable [on|off]        # 切换 noVNC 只读/可写
+#   browser-session screenshot <out.png>     # 截自己的主窗口
+#   browser-session xdotool <args...>        # 在自己的窗口上跑 xdotool（自动 --window）
+#   browser-session activate                 # 把自己的窗口置顶
+set -euo pipefail
+source "$(dirname "$0")/env.sh"
+
+# 反查本 session 的 token：沿自己的父进程链向上，找 by-pid/<ancestor>.token
+find_token() {
+  if [ -n "${ACS_SESSION_TOKEN:-}" ]; then echo "$ACS_SESSION_TOKEN"; return 0; fi
+  local pid=$$
+  for _ in $(seq 1 40); do
+    [ "$pid" -le 1 ] && break
+    local f="$ACS_RUN/sessions/by-pid/${pid}.token"
+    [ -f "$f" ] && { cat "$f"; return 0; }
+    pid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null) || break
+    [ -z "$pid" ] && break
+  done
+  return 1
+}
+
+TOKEN="$(find_token || true)"
+[ -z "$TOKEN" ] && { echo "ERROR: 找不到本 session 的 token（不在受管 MCP 会话内？）" >&2; exit 2; }
+
+manifest() { curl -fsS "http://127.0.0.1:${ACS_BROKER_PORT}/s/${TOKEN}/manifest"; }
+field() { manifest | python3 -c "import sys,json;print(json.load(sys.stdin).get('$1') or '')"; }
+
+cmd="${1:-info}"; shift || true
+case "$cmd" in
+  info)       manifest ;;
+  token)      echo "$TOKEN" ;;
+  vnc)        field novncUrl ;;
+  writable)   on="${1:-on}"; q=$([ "$on" = off ] && echo 0 || echo 1)
+              curl -fsS "http://127.0.0.1:${ACS_BROKER_PORT}/s/${TOKEN}/viewonly?on=$([ "$q" = 1 ] && echo 0 || echo 1)" ;;
+  screenshot) out="${1:?用法: browser-session screenshot <out.png>}"
+              win="$(field primaryWindowId)"; [ -z "$win" ] && { echo "no window yet" >&2; exit 1; }
+              DISPLAY="$ACS_DISPLAY" import -window "$win" "$out" && echo "saved $out (window $win)" ;;
+  xdotool)    win="$(field primaryWindowId)"; [ -z "$win" ] && { echo "no window yet" >&2; exit 1; }
+              DISPLAY="$ACS_DISPLAY" xdotool "$@" --window "$win" ;;
+  activate)   win="$(field primaryWindowId)"; [ -z "$win" ] && { echo "no window yet" >&2; exit 1; }
+              DISPLAY="$ACS_DISPLAY" xdotool windowactivate "$win" 2>/dev/null || DISPLAY="$ACS_DISPLAY" xdotool windowraise "$win" ;;
+  *)          echo "unknown: $cmd (info|vnc|writable|screenshot|xdotool|activate|token)" >&2; exit 2 ;;
+esac

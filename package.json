@@ -1,0 +1,43 @@
+{
+  "name": "@botmux-ai/plugin-agent-chrome",
+  "version": "0.1.0",
+  "description": "Agent Chrome Stack plugin for botmux.",
+  "type": "commonjs",
+  "keywords": [
+    "botmux-plugin"
+  ],
+  "scripts": {
+    "build": "node ./scripts/build.mjs",
+    "validate": "node ./scripts/validate.mjs",
+    "test": "npm run build && npm run validate"
+  },
+  "dependencies": {
+    "puppeteer-core": "^25.2.1",
+    "ws": "^8.18.0"
+  },
+  "peerDependencies": {
+    "botmux": ">=0.0.0"
+  },
+  "botmux": {
+    "schemaVersion": 1,
+    "id": "agent-chrome",
+    "displayName": "Agent Chrome",
+    "service": {
+      "mode": "manual"
+    }
+  },
+  "files": [
+    "README.md",
+    "package.json",
+    "bin/",
+    "cli/",
+    "dashboard/",
+    "lib/",
+    "mcp/",
+    "service/",
+    "skills/",
+    "test/"
+  ],
+  "license": "MIT"
+}
+
