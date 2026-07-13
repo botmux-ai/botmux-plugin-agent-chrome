@@ -125,6 +125,19 @@ function recordTargetInfo(token, targetInfo) {
   writeManifest(token);
 }
 
+function refreshTargetInfoLater(token, targetId, delayMs = 600) {
+  const timer = setTimeout(async () => {
+    if (!sessions.has(token) || targetOwner.get(targetId) !== token) return;
+    try {
+      const { targetInfo } = await control.send('Target.getTargetInfo', { targetId });
+      recordTargetInfo(token, targetInfo);
+    } catch (error) {
+      log(`target metadata refresh warn target=${targetId.slice(0, 8)}: ${error.message}`);
+    }
+  }, delayMs);
+  timer.unref();
+}
+
 function mostRecentPage(s) {
   return [...s.pages.values()]
     .filter((page) => page.winId)
@@ -138,6 +151,18 @@ function freeFallbackPage(s) {
   }
   const active = s.pages.get(s.agentActiveTargetId);
   return active?.winId ? active : mostRecentPage(s);
+}
+
+function activatePageWindow(page) {
+  const winId = String(page?.winId || '');
+  if (!/^\d+$/.test(winId)) return false;
+  try {
+    xdo(`xdotool windowmap ${winId} windowraise ${winId} windowactivate --sync ${winId}`);
+    return true;
+  } catch (error) {
+    log(`window activate warn win=${winId}: ${error.message}`);
+    return false;
+  }
 }
 
 function allocatePorts() {
@@ -159,6 +184,17 @@ function spawnX11vnc(view) {
   return spawn('x11vnc', x11vncArgs(view), {
     stdio: ['ignore', fs.openSync(logFile, 'a'), fs.openSync(logFile, 'a')],
   });
+}
+
+function terminateChild(child, forceAfterMs = 180) {
+  if (!child || child.exitCode !== null) return;
+  try { child.kill('SIGTERM'); } catch {}
+  const timer = setTimeout(() => {
+    if (child.exitCode === null) {
+      try { child.kill('SIGKILL'); } catch {}
+    }
+  }, forceAfterMs);
+  timer.unref();
 }
 
 function waitForTcp(port, timeoutMs = 4000) {
@@ -204,7 +240,7 @@ function startVnc(s, kind, page) {
     `0.0.0.0:${view.novncPort}`,
     `localhost:${view.vncPort}`,
   ], { stdio: ['ignore', fs.openSync(novncLog, 'a'), fs.openSync(novncLog, 'a')] });
-  view.novncUrl = `http://${HOST}:${view.novncPort}/vnc.html?autoconnect=true&resize=scale&path=websockify`;
+  view.novncUrl = `http://${HOST}:${view.novncPort}/vnc.html?autoconnect=true&reconnect=true&reconnect_delay=1000&resize=scale&path=websockify`;
   s[`${kind}Vnc`] = view;
   touch(s);
   void Promise.all([waitForTcp(view.vncPort), waitForTcp(view.novncPort)])
@@ -226,15 +262,42 @@ function startVnc(s, kind, page) {
 }
 
 function restartX11vnc(s, view) {
-  try { view.vncProc?.kill('SIGTERM'); } catch {}
+  terminateChild(view.vncProc);
   if (view.rebindTimer) clearTimeout(view.rebindTimer);
+  view.ready = false;
+  view.error = null;
   view.rebindTimer = setTimeout(() => {
     if (!sessions.has(s.token) || s[`${view.kind}Vnc`] !== view) return;
     view.vncProc = spawnX11vnc(view);
     view.rebindTimer = null;
     touch(s);
     writeManifest(s.token);
+    void waitForTcp(view.vncPort)
+      .then(() => {
+        if (!sessions.has(s.token) || s[`${view.kind}Vnc`] !== view) return;
+        view.ready = true;
+        touch(s);
+        writeManifest(s.token);
+      })
+      .catch((error) => {
+        if (!sessions.has(s.token) || s[`${view.kind}Vnc`] !== view) return;
+        view.error = error.message;
+        touch(s);
+        writeManifest(s.token);
+      });
   }, 300);
+}
+
+async function waitForViewReady(s, kind, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const view = s?.[`${kind}Vnc`];
+    if (!view) return false;
+    if (view.error) return false;
+    if (view.ready && !view.rebindTimer) return true;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  return false;
 }
 
 function ensureVnc(s, kind, targetId) {
@@ -256,8 +319,8 @@ function disposeVnc(s, kind) {
   const view = s[`${kind}Vnc`];
   if (!view) return;
   if (view.rebindTimer) clearTimeout(view.rebindTimer);
-  try { view.vncProc?.kill('SIGTERM'); } catch {}
-  try { view.novncProc?.kill('SIGTERM'); } catch {}
+  terminateChild(view.vncProc);
+  terminateChild(view.novncProc);
   usedPortSlots.delete(view.slot);
   s[`${kind}Vnc`] = null;
   touch(s);
@@ -268,8 +331,10 @@ function markAgentActive(token, targetId) {
   if (!targetId || targetOwner.get(targetId) !== token) return;
   const s = getSession(token);
   const page = ensurePage(s, targetId);
+  const targetChanged = s.agentActiveTargetId !== targetId;
   page.lastActiveAt = Date.now();
   s.agentActiveTargetId = targetId;
+  if (!s.freeEnabled && targetChanged) activatePageWindow(page);
   if (page.winId) ensureVnc(s, 'follow', targetId);
   touch(s);
   writeManifest(token);
@@ -281,6 +346,7 @@ function selectFreeTarget(s, targetId) {
   s.freeTargetId = targetId;
   s.freeHistory = s.freeHistory.filter((id) => id !== targetId);
   s.freeHistory.push(targetId);
+  activatePageWindow(page);
   ensureVnc(s, 'free', targetId);
   touch(s);
   writeManifest(s.token);
@@ -294,6 +360,8 @@ function setViewMode(token, mode) {
     s.freeEnabled = false;
     s.freeTargetId = null;
     disposeVnc(s, 'free');
+    const page = s.pages.get(s.agentActiveTargetId) || mostRecentPage(s);
+    if (page) activatePageWindow(page);
   } else {
     s.freeEnabled = true;
     const page = freeFallbackPage(s);
@@ -338,7 +406,10 @@ function removePage(token, targetId) {
     if (s.agentActiveTargetId === targetId) {
       const next = mostRecentPage(s);
       s.agentActiveTargetId = next?.targetId || null;
-      if (next) ensureVnc(s, 'follow', next.targetId);
+      if (next) {
+        if (!s.freeEnabled) activatePageWindow(next);
+        ensureVnc(s, 'follow', next.targetId);
+      }
     }
     if (s.freeTargetId === targetId) {
       const next = freeFallbackPage(s);
@@ -411,7 +482,16 @@ async function provisionOne(token, targetId) {
   if (page.winId) return;
   page.cdpWindowId = cdpWindowId;
   page.winId = winId;
+  try {
+    const { targetInfo } = await control.send('Target.getTargetInfo', { targetId });
+    recordTargetInfo(token, targetInfo);
+  } catch (error) {
+    log(`target metadata warn target=${targetId.slice(0, 8)}: ${error.message}`);
+  }
+  refreshTargetInfoLater(token, targetId);
+  refreshTargetInfoLater(token, targetId, 1800);
   if (!s.agentActiveTargetId) s.agentActiveTargetId = targetId;
+  if (!s.freeEnabled && s.agentActiveTargetId === targetId) activatePageWindow(page);
   ensureVnc(s, 'follow', s.agentActiveTargetId);
   if (s.freeEnabled && !selectFreeTarget(s, s.freeTargetId || targetId)) selectFreeTarget(s, targetId);
   touch(s);
@@ -756,7 +836,9 @@ const server = http.createServer(async (req, res) => {
     const on = u.query.on !== '0';
     const mode = u.query.mode === 'free' ? 'free' : 'follow';
     const ok = setViewonly(m[1], on, mode);
-    jsonResponse(res, ok ? 200 : 404, { ok, mode, viewonly: on });
+    const s = sessions.get(m[1]);
+    const ready = ok && await waitForViewReady(s, mode);
+    jsonResponse(res, ready ? 200 : (ok ? 503 : 404), { ok: ready, mode, viewonly: on });
     return;
   }
   m = u.pathname.match(/^\/s\/([^/]+)\/view-mode$/);
@@ -764,7 +846,9 @@ const server = http.createServer(async (req, res) => {
     let body;
     try { body = await readJsonBody(req); } catch { jsonResponse(res, 400, { error: 'bad_json' }); return; }
     const manifest = setViewMode(m[1], body?.mode);
-    jsonResponse(res, manifest ? 200 : 400, manifest || { error: 'invalid_session_or_mode' });
+    const s = sessions.get(m[1]);
+    const ready = manifest && (body?.mode !== 'free' || await waitForViewReady(s, 'free'));
+    jsonResponse(res, ready ? 200 : (manifest ? 503 : 400), ready ? manifestFor(m[1]) : { error: manifest ? 'view_not_ready' : 'invalid_session_or_mode' });
     return;
   }
   m = u.pathname.match(/^\/s\/([^/]+)\/free-target$/);
@@ -780,7 +864,8 @@ const server = http.createServer(async (req, res) => {
     s.freeEnabled = true;
     touch(s);
     writeManifest(s.token);
-    jsonResponse(res, 200, manifestFor(s.token));
+    const ready = await waitForViewReady(s, 'free');
+    jsonResponse(res, ready ? 200 : 503, ready ? manifestFor(s.token) : { error: 'view_not_ready' });
     return;
   }
   // 健康检查

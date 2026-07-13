@@ -12,6 +12,21 @@ bash "$ACS_BIN/start-chrome.sh"
 if curl -fsS "http://127.0.0.1:${ACS_BROKER_PORT}/sessions" >/dev/null 2>&1; then
   echo "[broker] already up on :${ACS_BROKER_PORT}"
 else
+  # broker 异常退出时，x11vnc/websockify 可能成为孤儿进程。新 broker 会从
+  # 基础端口重新分配，先回收插件专属端口段，避免连到旧 Session 的画面。
+  echo "[broker] cleaning stale VNC listeners"
+  stale_pids=()
+  for port in $(seq "$ACS_VNC_BASE" $((ACS_VNC_BASE+40))) $(seq "$ACS_NOVNC_BASE" $((ACS_NOVNC_BASE+40))); do
+    pid=$(ss -ltnp 2>/dev/null | grep ":${port} " | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2 || true)
+    if [ -n "$pid" ]; then
+      stale_pids+=("$pid")
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
+  sleep 0.2
+  for pid in "${stale_pids[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null || true; fi
+  done
   echo "[broker] starting on :${ACS_BROKER_PORT}"
   nohup node "$ACS_BIN/broker.js" >"$ACS_LOGS/broker.log" 2>&1 &
   for i in $(seq 1 50); do

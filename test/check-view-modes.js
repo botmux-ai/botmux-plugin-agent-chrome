@@ -3,6 +3,7 @@
 // Session dashboard state machine: Follow tracks Agent activity; Free keeps one
 // stable noVNC endpoint while switching Page targets and falls back on close.
 const WebSocket = require('ws');
+const { execFileSync } = require('child_process');
 const { CDP, httpGetJson } = require('../lib/cdp');
 
 const BROKER = `http://127.0.0.1:${process.env.ACS_BROKER_PORT || 9300}`;
@@ -11,6 +12,27 @@ const TOKEN = `views${Date.now()}`;
 const BOTMUX_SESSION_ID = `botmux-e2e-${Date.now()}`;
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function activeWindowId() {
+  try {
+    return execFileSync('xdotool', ['getactivewindow'], {
+      encoding: 'utf8',
+      env: { ...process.env, DISPLAY: process.env.ACS_DISPLAY || ':77' },
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+async function waitForActiveWindow(windowId, timeoutMs = 4_000) {
+  const expected = String(windowId);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (activeWindowId() === expected) return true;
+    await sleep(100);
+  }
+  return false;
+}
 
 async function connect() {
   const ws = new WebSocket(
@@ -68,21 +90,26 @@ async function waitFor(predicate, timeoutMs = 12_000) {
     const followPort = manifest.follow.novncPort;
 
     await cdp.send('Target.activateTarget', { targetId: first.targetId });
-    manifest = await waitFor(value => value.follow?.targetId === first.targetId);
+    manifest = await waitFor(value => value.follow?.targetId === first.targetId && value.follow?.status === 'connected');
     const followReused = manifest.follow.novncUrl === followUrl && manifest.follow.novncPort === followPort;
+    const followWindowActivated = await waitForActiveWindow(manifest.follow.windowId);
 
     await put(`/s/${TOKEN}/view-mode`, { mode: 'free' });
     manifest = await waitFor(value => value.mode === 'free' && value.free?.novncUrl);
     const freeStarted = manifest.mode === 'free' && Boolean(manifest.free?.novncUrl);
     const freeUrl = manifest.free.novncUrl;
     const freePort = manifest.free.novncPort;
+    const autoReconnect = freeUrl.includes('reconnect=true');
 
     manifest = await put(`/s/${TOKEN}/free-target`, { targetId: second.targetId });
-    await waitFor(value => value.free?.targetId === second.targetId && value.free?.status === 'connected');
+    manifest = await waitFor(value => value.free?.targetId === second.targetId && value.free?.status === 'connected');
     const freeReused = manifest.free.novncUrl === freeUrl && manifest.free.novncPort === freePort;
+    const freeWindowActivated = await waitForActiveWindow(manifest.free.windowId);
 
     await cdp.send('Target.closeTarget', { targetId: second.targetId });
-    manifest = await waitFor(value => value.pages?.length === 1 && value.free?.targetId === first.targetId);
+    manifest = await waitFor(value => value.pages?.length === 1
+      && value.free?.targetId === first.targetId
+      && value.free?.status === 'connected');
     const closeFallback = manifest.mode === 'free'
       && manifest.free.novncUrl === freeUrl
       && manifest.free.novncPort === freePort;
@@ -91,15 +118,21 @@ async function waitFor(predicate, timeoutMs = 12_000) {
     const freeReclaimed = manifest.mode === 'follow'
       && manifest.free?.enabled === false
       && !manifest.free?.novncUrl;
+    const followRestored = await waitForActiveWindow(manifest.follow.windowId);
 
-    const pass = metadataLinked && followReused && freeStarted && freeReused && closeFallback && freeReclaimed;
+    const pass = metadataLinked && followReused && followWindowActivated && freeStarted && autoReconnect
+      && freeReused && freeWindowActivated && closeFallback && freeReclaimed && followRestored;
     console.log(JSON.stringify({
       metadataLinked,
       followReused,
+      followWindowActivated,
       freeStarted,
+      autoReconnect,
       freeReused,
+      freeWindowActivated,
       closeFallback,
       freeReclaimed,
+      followRestored,
     }, null, 2));
     console.log(pass ? 'PASS: Session Follow/Free VNC 状态机正常' : 'FAIL');
     process.exitCode = pass ? 0 : 1;
