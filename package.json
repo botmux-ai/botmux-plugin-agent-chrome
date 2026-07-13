@@ -1,6 +1,6 @@
 {
   "name": "@botmux-ai/plugin-agent-chrome",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Agent Chrome Stack plugin for botmux.",
   "type": "commonjs",
   "keywords": [
@@ -16,6 +16,7 @@
     "chrome-devtools-mcp": "1.5.0",
     "esbuild": "^0.28.0",
     "puppeteer-core": "^25.2.1",
+    "react": "^19.2.7",
     "ws": "^8.18.0"
   },
   "botmux": {

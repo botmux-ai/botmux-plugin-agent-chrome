@@ -1,8 +1,8 @@
 # Agent Chrome Plugin
 
 Botmux plugin packaging for ACS — Agent Chrome Stack. It provides one shared
-headful Chrome instance, per-session CDP isolation, and per-session noVNC views
-for agent CLIs.
+headful Chrome instance, per-session CDP isolation, and two noVNC viewing modes
+for each agent CLI session: Follow Agent and Free Browsing.
 
 GitHub: https://github.com/botmux-ai/botmux-plugin-agent-chrome
 
@@ -54,7 +54,7 @@ Use a `file:` URL so Botmux lets npm unpack the tarball and persist only its
 self-contained `dist/` runtime:
 
 ```bash
-botmux plugin install "file:/absolute/path/agent-chrome-botmux-plugin-0.1.1.tgz"
+botmux plugin install "file:/absolute/path/botmux-ai-plugin-agent-chrome-0.2.0.tgz"
 botmux plugin enable agent-chrome
 botmux plugin service start agent-chrome
 botmux plugin service status
@@ -84,6 +84,21 @@ with `botmux plugin service start|stop|restart agent-chrome`.
 
 Start a new Codex/agent session after enabling the plugin so it reloads the
 `agent-chrome` MCP configuration and skill.
+
+Open the Agent Chrome page from the Botmux Dashboard after an agent creates its
+first browser page. The page joins each browser connection to its Botmux CLI
+session and provides:
+
+- A session list, with the Bot name and CLI shown as secondary context.
+- **Follow Agent**, which tracks the page currently operated by the agent.
+- **Free Browsing**, which keeps one stable noVNC URL while you switch among the
+  pages owned by that session.
+- View-only mode by default, with an explicit switch for keyboard and mouse
+  input.
+- Copy-link and independent-window actions for the current noVNC stream.
+
+The independent-window action currently opens the raw noVNC view. A dedicated
+standalone viewer with its own page switcher is intentionally deferred.
 
 ## Local Development
 
@@ -162,6 +177,7 @@ The original ACS test scripts are preserved under `test/`:
 - `check-vnc.js`
 - `check-puppeteer.js`
 - `check-writable-toggle.js`
+- `check-view-modes.js`
 - `check-3session.js`
 - `check-mcp-e2e.js`
 

@@ -8,9 +8,16 @@ const path = require('path');
 
 const WRAPPER = path.join(__dirname, '..', 'dist', 'bin', 'mcp-launch.sh');
 const FIXED_TOKEN = 'e2e' + Date.now();
+const BOTMUX_SESSION_ID = 'botmux-mcp-e2e-' + Date.now();
+const BROKER_PORT = process.env.ACS_BROKER_PORT || 9300;
+const BROKER = `http://127.0.0.1:${BROKER_PORT}`;
 
 const child = spawn('bash', [WRAPPER], {
-  env: { ...process.env, ACS_SESSION_TOKEN: FIXED_TOKEN },
+  env: {
+    ...process.env,
+    ACS_SESSION_TOKEN: FIXED_TOKEN,
+    BOTMUX_SESSION_ID,
+  },
   stdio: ['pipe', 'pipe', 'pipe'],
 });
 
@@ -70,8 +77,10 @@ const txt = (r) => (r.result && r.result.content || []).map((c) => c.text || '')
 
   // broker 侧应看到本 token 的连接 + manifest
   let mf = {};
-  for (let i=0;i<60;i++){ try { mf = JSON.parse(execSync(`curl -fsS http://127.0.0.1:9300/s/${FIXED_TOKEN}/manifest`, {encoding:'utf8'})); if (mf.primaryWindowId) break; } catch {} await new Promise(r=>setTimeout(r,150)); }
+  for (let i=0;i<60;i++){ try { mf = JSON.parse(execSync(`curl -fsS ${BROKER}/s/${FIXED_TOKEN}/manifest`, {encoding:'utf8'})); if (mf.primaryWindowId && mf.novncUrl) break; } catch {} await new Promise(r=>setTimeout(r,150)); }
   console.log('manifest novncUrl:', mf.novncUrl || '(none)');
+  const sessionLinked = mf.botmuxSessionId === BOTMUX_SESSION_ID && mf.pages?.length === 1;
+  console.log('botmux session linked:', sessionLinked);
 
   const sessionInfo = await rpc('tools/call', { name: 'browser_session_info', arguments: {} });
   const infoText = txt(sessionInfo);
@@ -82,9 +91,27 @@ const txt = (r) => (r.result && r.result.content || []).map((c) => c.text || '')
   const vncOk = /vnc\.html/.test(txt(vnc));
   console.log('session vnc:', vncOk);
 
+  const freeResponse = await fetch(`${BROKER}/s/${FIXED_TOKEN}/view-mode`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ mode: 'free' }),
+  });
+  const freeManifest = await freeResponse.json();
+  for (let i = 0; i < 40 && !freeManifest.free?.novncUrl; i++) {
+    await new Promise(resolve => setTimeout(resolve, 100));
+    try {
+      const latest = JSON.parse(execSync(`curl -fsS ${BROKER}/s/${FIXED_TOKEN}/manifest`, { encoding: 'utf8' }));
+      Object.assign(freeManifest, latest);
+    } catch {}
+  }
+  const freeVnc = await rpc('tools/call', { name: 'browser_session_get_vnc_url', arguments: { mode: 'free' } });
+  const freeVncOk = freeResponse.ok && freeManifest.free?.enabled === true && /vnc\.html/.test(txt(freeVnc));
+  console.log('session free vnc:', freeVncOk);
+
   const writable = await rpc('tools/call', { name: 'browser_session_set_writable', arguments: { writable: true } });
   const readonly = await rpc('tools/call', { name: 'browser_session_set_writable', arguments: { writable: false } });
-  const writableOk = /enabled/.test(txt(writable)) && /view-only/.test(txt(readonly));
+  const freeWritable = await rpc('tools/call', { name: 'browser_session_set_writable', arguments: { mode: 'free', writable: true } });
+  const writableOk = /enabled/.test(txt(writable)) && /view-only/.test(txt(readonly)) && /enabled/.test(txt(freeWritable));
   console.log('session writable toggle:', writableOk);
 
   const shot = path.join('/tmp', `agent-chrome-mcp-${FIXED_TOKEN}.png`);
@@ -106,8 +133,8 @@ const txt = (r) => (r.result && r.result.content || []).map((c) => c.text || '')
   const nativeInputBounded = unsafeKeys.result?.isError === true && outsideClick.result?.isError === true;
   console.log('session native input rejects escape attempts:', nativeInputBounded);
 
-  const pass = toolsMerged && newPageOk && pageListed && mf.novncUrl
-    && infoOk && vncOk && writableOk && screenshotOk && nativeInputOk && nativeInputBounded;
+  const pass = toolsMerged && newPageOk && pageListed && mf.novncUrl && sessionLinked
+    && infoOk && vncOk && freeVncOk && writableOk && screenshotOk && nativeInputOk && nativeInputBounded;
   console.log(pass ? 'PASS: 端到端（真实 MCP）链路打通且被管理' : 'FAIL');
 
   child.kill('SIGTERM');

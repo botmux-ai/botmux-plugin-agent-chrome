@@ -8,15 +8,16 @@
  *  2. CDP 过滤隔离：每条 agent 连接独占一条到真 Chrome 的 upstream，
  *     按 token 维护 target 归属；过滤 Target.* 可见性、拒绝跨 owner 的 close/attach。
  *     → A 看不到也关不掉 B 的页面（硬隔离）。
- *  3. 反应式分配：某 token 第一次创建窗口时，自动 kiosk 全屏、映射 X11 window-id、
- *     起该窗口专属的 x11vnc + noVNC、落 manifest。
- *  4. 旁路 HTTP：/s/<token>/manifest、/sessions、/ 提供环境信息与观看入口。
+ *  3. Session 视图：每个 token 维护 Page 列表、一个跟随 Agent 的 Follow VNC，
+ *     以及按需创建且复用端口的 Free VNC；切 Page 只重绑 x11vnc。
+ *  4. 旁路 HTTP：/s/<token>/manifest、视图控制、/sessions 提供 Dashboard 数据。
  */
 const http = require('http');
 const url = require('url');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const net = require('net');
 const { execSync, spawn } = require('child_process');
 const WebSocket = require('ws');
 const { CDP, httpGetJson } = require('../lib/cdp');
@@ -44,7 +45,7 @@ let chromeBrowserWsUrl = null;       // 真 Chrome 的 browser ws
 let control = null;                  // broker 自用控制连接（provisioning）
 const targetOwner = new Map();       // targetId -> token（全局归属表）
 const sessions = new Map();          // token -> session 状态
-let portCursor = 0;                  // 端口分配游标
+const usedPortSlots = new Set();     // Follow / Free VNC 共用端口池
 const mappedWindows = new Set();     // 已分配的 X11 window-id（全局，供"新窗口差集"映射）
 let provChain = Promise.resolve();   // provisioning 串行化队列（避免并发映射歧义）
 
@@ -52,6 +53,21 @@ async function ensureChrome() {
   const v = await httpGetJson(`http://127.0.0.1:${CFG.chromePort}/json/version`);
   chromeBrowserWsUrl = v.webSocketDebuggerUrl;
   control = await CDP.connectBrowser(`http://127.0.0.1:${CFG.chromePort}`);
+  await control.send('Target.setDiscoverTargets', { discover: true });
+  control.on((message) => {
+    const method = message.method || '';
+    if (method === 'Target.targetInfoChanged') {
+      const targetInfo = message.params?.targetInfo;
+      const owner = targetInfo ? targetOwner.get(targetInfo.targetId) : null;
+      if (owner) recordTargetInfo(owner, targetInfo);
+      return;
+    }
+    if (method === 'Target.targetDestroyed') {
+      const targetId = message.params?.targetId;
+      const owner = targetId ? targetOwner.get(targetId) : null;
+      if (owner) removePage(owner, targetId);
+    }
+  });
   log('connected control to real chrome', chromeBrowserWsUrl);
   // chrome 挂了（OOM/重启）→ 控制连接断 → 退出，交给 systemd 重启本进程，
   // 其 ExecStartPre 会等 chrome 回来后重连，实现自愈。
@@ -59,13 +75,280 @@ async function ensureChrome() {
   control.ws.on('error', () => { log('control connection error → exiting for restart'); process.exit(1); });
 }
 
-function getSession(token) {
+function getSession(token, metadata = {}) {
   let s = sessions.get(token);
   if (!s) {
-    s = { token, windows: new Map(), vnc: null, viewonly: true, createdAt: Date.now(), connCount: 0 };
+    s = {
+      token,
+      botmuxSessionId: null,
+      pages: new Map(),
+      cdpSessions: new Map(),
+      agentActiveTargetId: null,
+      freeTargetId: null,
+      freeHistory: [],
+      freeEnabled: false,
+      followVnc: null,
+      freeVnc: null,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      connCount: 0,
+    };
     sessions.set(token, s);
   }
+  if (typeof metadata.botmuxSessionId === 'string' && metadata.botmuxSessionId.trim()) {
+    s.botmuxSessionId = metadata.botmuxSessionId.trim().slice(0, 256);
+    s.updatedAt = Date.now();
+  }
   return s;
+}
+
+function touch(s) { s.updatedAt = Date.now(); }
+
+function ensurePage(s, targetId) {
+  let page = s.pages.get(targetId);
+  if (!page) {
+    const now = Date.now();
+    page = { targetId, winId: null, cdpWindowId: null, title: '', url: '', createdAt: now, lastActiveAt: now };
+    s.pages.set(targetId, page);
+    touch(s);
+  }
+  return page;
+}
+
+function recordTargetInfo(token, targetInfo) {
+  if (!targetInfo || targetInfo.type !== 'page' || targetOwner.get(targetInfo.targetId) !== token) return;
+  const s = getSession(token);
+  const page = ensurePage(s, targetInfo.targetId);
+  if (typeof targetInfo.title === 'string') page.title = targetInfo.title;
+  if (typeof targetInfo.url === 'string') page.url = targetInfo.url;
+  touch(s);
+  writeManifest(token);
+}
+
+function mostRecentPage(s) {
+  return [...s.pages.values()]
+    .filter((page) => page.winId)
+    .sort((a, b) => b.lastActiveAt - a.lastActiveAt || b.createdAt - a.createdAt)[0] || null;
+}
+
+function freeFallbackPage(s) {
+  for (let i = s.freeHistory.length - 1; i >= 0; i--) {
+    const page = s.pages.get(s.freeHistory[i]);
+    if (page?.winId) return page;
+  }
+  const active = s.pages.get(s.agentActiveTargetId);
+  return active?.winId ? active : mostRecentPage(s);
+}
+
+function allocatePorts() {
+  let slot = 0;
+  while (usedPortSlots.has(slot)) slot++;
+  usedPortSlots.add(slot);
+  return { slot, vncPort: CFG.vncBase + slot, novncPort: CFG.novncBase + slot };
+}
+
+function x11vncArgs(view) {
+  const args = ['-id', String(view.winId), '-display', CFG.display, '-rfbport', String(view.vncPort),
+    '-localhost', '-forever', '-shared', '-nopw', '-noxdamage', '-quiet'];
+  if (view.viewonly) args.push('-viewonly');
+  return args;
+}
+
+function spawnX11vnc(view) {
+  const logFile = `${CFG.logs}/x11vnc-${view.vncPort}.log`;
+  return spawn('x11vnc', x11vncArgs(view), {
+    stdio: ['ignore', fs.openSync(logFile, 'a'), fs.openSync(logFile, 'a')],
+  });
+}
+
+function waitForTcp(port, timeoutMs = 4000) {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve, reject) => {
+    const attempt = () => {
+      const socket = net.createConnection({ host: '127.0.0.1', port });
+      let settled = false;
+      const finish = (ok) => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        if (ok) resolve();
+        else if (Date.now() >= deadline) reject(new Error(`port ${port} did not become ready`));
+        else setTimeout(attempt, 50);
+      };
+      socket.once('connect', () => finish(true));
+      socket.once('error', () => finish(false));
+      socket.setTimeout(300, () => finish(false));
+    };
+    attempt();
+  });
+}
+
+function startVnc(s, kind, page) {
+  const ports = allocatePorts();
+  const view = {
+    kind,
+    targetId: page.targetId,
+    winId: page.winId,
+    viewonly: true,
+    ...ports,
+    vncProc: null,
+    novncProc: null,
+    rebindTimer: null,
+    ready: false,
+    error: null,
+  };
+  view.vncProc = spawnX11vnc(view);
+  const novncLog = `${CFG.logs}/novnc-${view.novncPort}.log`;
+  view.novncProc = spawn('websockify', [
+    `--web=${CFG.novncWeb}`,
+    `0.0.0.0:${view.novncPort}`,
+    `localhost:${view.vncPort}`,
+  ], { stdio: ['ignore', fs.openSync(novncLog, 'a'), fs.openSync(novncLog, 'a')] });
+  view.novncUrl = `http://${HOST}:${view.novncPort}/vnc.html?autoconnect=true&resize=scale&path=websockify`;
+  s[`${kind}Vnc`] = view;
+  touch(s);
+  void Promise.all([waitForTcp(view.vncPort), waitForTcp(view.novncPort)])
+    .then(() => {
+      if (!sessions.has(s.token) || s[`${kind}Vnc`] !== view) return;
+      view.ready = true;
+      touch(s);
+      writeManifest(s.token);
+    })
+    .catch((error) => {
+      if (!sessions.has(s.token) || s[`${kind}Vnc`] !== view) return;
+      view.error = error.message;
+      touch(s);
+      writeManifest(s.token);
+      log(`${kind} vnc failed token=${s.token.slice(0, 8)}: ${error.message}`);
+    });
+  log(`${kind} vnc up token=${s.token.slice(0, 8)} target=${page.targetId.slice(0, 8)} win=${page.winId} vnc=${view.vncPort} novnc=${view.novncPort}`);
+  return view;
+}
+
+function restartX11vnc(s, view) {
+  try { view.vncProc?.kill('SIGTERM'); } catch {}
+  if (view.rebindTimer) clearTimeout(view.rebindTimer);
+  view.rebindTimer = setTimeout(() => {
+    if (!sessions.has(s.token) || s[`${view.kind}Vnc`] !== view) return;
+    view.vncProc = spawnX11vnc(view);
+    view.rebindTimer = null;
+    touch(s);
+    writeManifest(s.token);
+  }, 300);
+}
+
+function ensureVnc(s, kind, targetId) {
+  const page = s.pages.get(targetId);
+  if (!page?.winId) return null;
+  const current = s[`${kind}Vnc`];
+  if (!current) return startVnc(s, kind, page);
+  if (current.targetId !== targetId || current.winId !== page.winId) {
+    current.targetId = targetId;
+    current.winId = page.winId;
+    restartX11vnc(s, current);
+    touch(s);
+    log(`${kind} vnc rebind token=${s.token.slice(0, 8)} target=${targetId.slice(0, 8)} win=${page.winId}`);
+  }
+  return current;
+}
+
+function disposeVnc(s, kind) {
+  const view = s[`${kind}Vnc`];
+  if (!view) return;
+  if (view.rebindTimer) clearTimeout(view.rebindTimer);
+  try { view.vncProc?.kill('SIGTERM'); } catch {}
+  try { view.novncProc?.kill('SIGTERM'); } catch {}
+  usedPortSlots.delete(view.slot);
+  s[`${kind}Vnc`] = null;
+  touch(s);
+  log(`${kind} vnc down token=${s.token.slice(0, 8)}`);
+}
+
+function markAgentActive(token, targetId) {
+  if (!targetId || targetOwner.get(targetId) !== token) return;
+  const s = getSession(token);
+  const page = ensurePage(s, targetId);
+  page.lastActiveAt = Date.now();
+  s.agentActiveTargetId = targetId;
+  if (page.winId) ensureVnc(s, 'follow', targetId);
+  touch(s);
+  writeManifest(token);
+}
+
+function selectFreeTarget(s, targetId) {
+  const page = s.pages.get(targetId);
+  if (!page?.winId) return false;
+  s.freeTargetId = targetId;
+  s.freeHistory = s.freeHistory.filter((id) => id !== targetId);
+  s.freeHistory.push(targetId);
+  ensureVnc(s, 'free', targetId);
+  touch(s);
+  writeManifest(s.token);
+  return true;
+}
+
+function setViewMode(token, mode) {
+  const s = sessions.get(token);
+  if (!s || !['follow', 'free'].includes(mode)) return null;
+  if (mode === 'follow') {
+    s.freeEnabled = false;
+    s.freeTargetId = null;
+    disposeVnc(s, 'free');
+  } else {
+    s.freeEnabled = true;
+    const page = freeFallbackPage(s);
+    if (page) selectFreeTarget(s, page.targetId);
+  }
+  touch(s);
+  writeManifest(token);
+  return manifestFor(token);
+}
+
+function setViewonly(token, viewonly, mode = 'follow') {
+  const s = sessions.get(token);
+  const kind = mode === 'free' ? 'free' : 'follow';
+  const view = s?.[`${kind}Vnc`];
+  if (!s || !view) return false;
+  view.viewonly = viewonly;
+  restartX11vnc(s, view);
+  touch(s);
+  writeManifest(token);
+  return true;
+}
+
+function removePage(token, targetId) {
+  const s = sessions.get(token);
+  const page = s?.pages.get(targetId);
+  if (!s || !page) return;
+  s.pages.delete(targetId);
+  if (page.winId) mappedWindows.delete(page.winId);
+  targetOwner.delete(targetId);
+  for (const [sessionId, mappedTarget] of s.cdpSessions) {
+    if (mappedTarget === targetId) s.cdpSessions.delete(sessionId);
+  }
+  s.freeHistory = s.freeHistory.filter((id) => id !== targetId);
+
+  if (s.pages.size === 0) {
+    s.agentActiveTargetId = null;
+    s.freeTargetId = null;
+    s.freeEnabled = false;
+    disposeVnc(s, 'follow');
+    disposeVnc(s, 'free');
+  } else {
+    if (s.agentActiveTargetId === targetId) {
+      const next = mostRecentPage(s);
+      s.agentActiveTargetId = next?.targetId || null;
+      if (next) ensureVnc(s, 'follow', next.targetId);
+    }
+    if (s.freeTargetId === targetId) {
+      const next = freeFallbackPage(s);
+      s.freeTargetId = next?.targetId || null;
+      if (s.freeEnabled && next) ensureVnc(s, 'free', next.targetId);
+      else disposeVnc(s, 'free');
+    }
+  }
+  touch(s);
+  writeManifest(token);
 }
 
 function acsWindows() {
@@ -115,79 +398,78 @@ function provision(token, targetId) {
 async function provisionOne(token, targetId) {
   const s = getSession(token);
   if (!sessions.has(token)) return; // 会话已结束
+  if (s.pages.get(targetId)?.winId) return;
   let cdpWindowId;
   try { ({ windowId: cdpWindowId } = await control.send('Browser.getWindowForTarget', { targetId })); }
   catch (e) { log('getWindowForTarget warn', e.message); return; }
 
   const winId = await mapWindow(cdpWindowId);
   if (!winId) { log('WARN: X11 window-id not found for', targetId.slice(0, 8)); return; }
-  if (!sessions.has(token)) return;
+  if (!sessions.has(token) || targetOwner.get(targetId) !== token) return;
   mappedWindows.add(winId);
-  if (s.windows.has(winId)) return;
-  s.windows.set(winId, { targetId, winId });
-
-  if (!s.vnc) {
-    const vncPort = CFG.vncBase + portCursor;
-    const novncPort = CFG.novncBase + portCursor;
-    portCursor++;
-    startVnc(s, winId, vncPort, novncPort);
-  }
+  const page = ensurePage(s, targetId);
+  if (page.winId) return;
+  page.cdpWindowId = cdpWindowId;
+  page.winId = winId;
+  if (!s.agentActiveTargetId) s.agentActiveTargetId = targetId;
+  ensureVnc(s, 'follow', s.agentActiveTargetId);
+  if (s.freeEnabled && !selectFreeTarget(s, s.freeTargetId || targetId)) selectFreeTarget(s, targetId);
+  touch(s);
   writeManifest(token);
   log(`provisioned token=${token.slice(0,8)} target=${targetId.slice(0,8)} win=${winId}`);
 }
 
-function startVnc(s, winId, vncPort, novncPort) {
-  const vncArgs = ['-id', winId, '-display', CFG.display, '-rfbport', String(vncPort),
-    '-localhost', '-forever', '-shared', '-nopw', '-noxdamage', '-quiet'];
-  if (s.viewonly) vncArgs.push('-viewonly');
-  const vnc = spawn('x11vnc', vncArgs, { stdio: ['ignore',
-    fs.openSync(`${CFG.logs}/x11vnc-${vncPort}.log`, 'a'),
-    fs.openSync(`${CFG.logs}/x11vnc-${vncPort}.log`, 'a')] });
-  const nov = spawn('websockify', ['--web=' + CFG.novncWeb, `0.0.0.0:${novncPort}`, `localhost:${vncPort}`],
-    { stdio: ['ignore', fs.openSync(`${CFG.logs}/novnc-${novncPort}.log`, 'a'),
-      fs.openSync(`${CFG.logs}/novnc-${novncPort}.log`, 'a')] });
-  s.vnc = { winId, vncPort, novncPort, vncPid: vnc.pid, novncPid: nov.pid, vncProc: vnc, novncProc: nov };
-  s.novncUrl = `http://${HOST}:${novncPort}/vnc.html?autoconnect=true&resize=scale&path=websockify`;
-  log(`vnc up token=${s.token.slice(0,8)} win=${winId} vnc=${vncPort} novnc=${novncPort} viewonly=${s.viewonly}`);
-}
-
-// 切换只读/可写：重启 x11vnc（agent 可调）
-function setViewonly(token, viewonly) {
-  const s = sessions.get(token);
-  if (!s || !s.vnc) return false;
-  s.viewonly = viewonly;
-  const { winId, vncPort, novncPort, vncProc } = s.vnc;
-  try { vncProc.kill('SIGTERM'); } catch {}
-  // novnc 保留，只重启 x11vnc
-  const vncArgs = ['-id', winId, '-display', CFG.display, '-rfbport', String(vncPort),
-    '-localhost', '-forever', '-shared', '-nopw', '-noxdamage', '-quiet'];
-  if (viewonly) vncArgs.push('-viewonly');
-  setTimeout(() => {
-    const vnc = spawn('x11vnc', vncArgs, { stdio: ['ignore',
-      fs.openSync(`${CFG.logs}/x11vnc-${vncPort}.log`, 'a'),
-      fs.openSync(`${CFG.logs}/x11vnc-${vncPort}.log`, 'a')] });
-    s.vnc.vncPid = vnc.pid; s.vnc.vncProc = vnc;
-    writeManifest(token);
-  }, 300);
-  return true;
+function publicVnc(view) {
+  if (!view) return null;
+  return {
+    targetId: view.targetId,
+    windowId: view.winId,
+    vncPort: view.vncPort,
+    novncPort: view.novncPort,
+    novncUrl: view.ready ? view.novncUrl : null,
+    viewonly: view.viewonly,
+    status: view.error ? 'error' : (!view.ready ? 'starting' : (view.rebindTimer ? 'reconnecting' : 'connected')),
+    ...(view.error ? { error: view.error } : {}),
+  };
 }
 
 function manifestFor(token) {
   const s = sessions.get(token);
   if (!s) return null;
-  const primary = s.vnc;
+  const primary = s.followVnc;
+  const publicPrimary = publicVnc(primary);
+  const pages = [...s.pages.values()]
+    .filter((page) => page.winId)
+    .sort((a, b) => b.lastActiveAt - a.lastActiveAt || a.createdAt - b.createdAt)
+    .map((page) => ({
+      targetId: page.targetId,
+      windowId: page.winId,
+      title: page.title,
+      url: page.url,
+      createdAt: page.createdAt,
+      lastActiveAt: page.lastActiveAt,
+    }));
   return {
     token,
+    botmuxSessionId: s.botmuxSessionId,
     DISPLAY: CFG.display,
     geometry: `${process.env.ACS_LOGICAL_W || 1728}x${process.env.ACS_LOGICAL_H || 1117}@${process.env.ACS_DPR || 2}x`,
-    windowIds: [...s.windows.keys()],
+    windowIds: pages.map((page) => page.windowId),
     primaryWindowId: primary ? primary.winId : null,
     vncPort: primary ? primary.vncPort : null,
     novncPort: primary ? primary.novncPort : null,
-    novncUrl: s.novncUrl || null,
-    viewonly: s.viewonly,
-    targets: [...s.windows.values()].map((w) => w.targetId),
-    updatedAt: Date.now(),
+    novncUrl: publicPrimary?.novncUrl || null,
+    viewonly: primary?.viewonly !== false,
+    targets: pages.map((page) => page.targetId),
+    pages,
+    mode: s.freeEnabled ? 'free' : 'follow',
+    agentActiveTargetId: s.agentActiveTargetId,
+    follow: publicPrimary,
+    free: s.freeVnc
+      ? { enabled: s.freeEnabled, ...publicVnc(s.freeVnc) }
+      : { enabled: s.freeEnabled },
+    createdAt: s.createdAt,
+    updatedAt: s.updatedAt,
   };
 }
 function writeManifest(token) {
@@ -199,15 +481,13 @@ function writeManifest(token) {
 function teardown(token) {
   const s = sessions.get(token);
   if (!s) return;
-  if (s.vnc) {
-    try { s.vnc.vncProc.kill('SIGTERM'); } catch {}
-    try { s.vnc.novncProc.kill('SIGTERM'); } catch {}
-  }
+  disposeVnc(s, 'follow');
+  disposeVnc(s, 'free');
   // 关掉该 token 的所有窗口/target
-  for (const w of s.windows.values()) {
-    control.send('Target.closeTarget', { targetId: w.targetId }).catch(() => {});
-    targetOwner.delete(w.targetId);
-    mappedWindows.delete(w.winId);
+  for (const page of s.pages.values()) {
+    control.send('Target.closeTarget', { targetId: page.targetId }).catch(() => {});
+    targetOwner.delete(page.targetId);
+    if (page.winId) mappedWindows.delete(page.winId);
   }
   try { fs.unlinkSync(path.join(CFG.manifests, token + '.json')); } catch {}
   sessions.delete(token);
@@ -218,7 +498,8 @@ function teardown(token) {
 function attachProxy(agentWs, token) {
   // 连接引用计数：同一 token 可有多条连接（holder + 偶发探测）；
   // 只有最后一条连接关闭才 teardown —— 避免一个瞬时连接拆掉整个会话。
-  getSession(token).connCount++;
+  const sessionState = getSession(token);
+  sessionState.connCount++;
   const up = new WebSocket(chromeBrowserWsUrl, { perMessageDeflate: false, maxPayload: 512 * 1024 * 1024 });
   const ownedTargets = new Set();
   const myTabs = new Set();                  // 本 token 的 tab target（在 createTarget 窗口内出现）
@@ -231,10 +512,22 @@ function attachProxy(agentWs, token) {
   //   targetId -> { msgs:[], sessionIds:Set, timer }
   const pendingByTarget = new Map();
   const BUF_MS = 1200;
+  function recordOwnedEvent(message) {
+    const method = message.method || '';
+    if (method === 'Target.targetCreated' || method === 'Target.targetInfoChanged') {
+      recordTargetInfo(token, message.params?.targetInfo);
+    } else if (method === 'Target.attachedToTarget') {
+      const targetInfo = message.params?.targetInfo;
+      if (targetInfo?.type === 'page' && message.params?.sessionId) {
+        sessionState.cdpSessions.set(message.params.sessionId, targetInfo.targetId);
+        recordTargetInfo(token, targetInfo);
+      }
+    }
+  }
   function flushOwned(t) {                   // 该 target 被本连接认领 → 缓冲事件作为"自己的"放行
     const e = pendingByTarget.get(t); if (!e) return;
     clearTimeout(e.timer); pendingByTarget.delete(t);
-    for (const msg of e.msgs) sendDown(msg);
+    for (const msg of e.msgs) { recordOwnedEvent(msg); sendDown(msg); }
   }
   function dropUnclaimed(t) {                 // 超时未认领 → 判定为别人的，隐藏其 session、丢弃事件
     const e = pendingByTarget.get(t); if (!e) return;
@@ -283,6 +576,10 @@ function attachProxy(agentWs, token) {
       sendDown({ id: m.id, error: { code: -32000, message: 'session not visible' } });
       return;
     }
+    const activeTarget = tid && targetOwner.get(tid) === token
+      ? tid
+      : (m.sessionId ? sessionState.cdpSessions.get(m.sessionId) : undefined);
+    if (activeTarget) markAgentActive(token, activeTarget);
     rawUp(JSON.stringify(m));
   });
 
@@ -301,7 +598,9 @@ function attachProxy(agentWs, token) {
         const t = m.result.targetId;
         targetOwner.set(t, token);
         ownedTargets.add(t);
+        ensurePage(sessionState, t);
         flushOwned(t);                       // 放行此前缓冲的 targetCreated/attachedToTarget
+        markAgentActive(token, t);
         provision(token, t).catch((e) => log('prov err', e.message));
       }
       sendDown(m);
@@ -313,6 +612,7 @@ function attachProxy(agentWs, token) {
       if (m.result && Array.isArray(m.result.targetInfos)) {
         m.result.targetInfos = m.result.targetInfos.filter(
           (ti) => ownedTargets.has(ti.targetId) || targetOwner.get(ti.targetId) === token);
+        for (const targetInfo of m.result.targetInfos) recordTargetInfo(token, targetInfo);
       }
       sendDown(m);
       return;
@@ -330,7 +630,9 @@ function attachProxy(agentWs, token) {
         return;                                                       // 否则是别人的 tab → 隐藏
       }
       if (ti.type !== 'page') { sendDown(m); return; }
-      if (ownedTargets.has(t) || targetOwner.get(t) === token) { ownedTargets.add(t); sendDown(m); }
+      if (ownedTargets.has(t) || targetOwner.get(t) === token) {
+        ownedTargets.add(t); recordTargetInfo(token, ti); sendDown(m);
+      }
       else if (targetOwner.has(t)) { /* 别人的 page → 丢 */ }
       else bufferEvent(t, m);
       return;
@@ -339,7 +641,7 @@ function attachProxy(agentWs, token) {
       const ti = m.params.targetInfo; const t = ti.targetId;
       if (ti.type === 'tab') { if (myTabs.has(t)) sendDown(m); return; }
       if (ti.type !== 'page') { sendDown(m); return; }
-      if (ownedTargets.has(t)) sendDown(m);
+      if (ownedTargets.has(t)) { recordTargetInfo(token, ti); sendDown(m); }
       else if (pendingByTarget.has(t)) bufferEvent(t, m);
       return;
     }
@@ -350,7 +652,12 @@ function attachProxy(agentWs, token) {
         return;
       }
       if (ti.type !== 'page') { sendDown(m); return; }
-      if (ownedTargets.has(t) || targetOwner.get(t) === token) { ownedTargets.add(t); sendDown(m); }
+      if (ownedTargets.has(t) || targetOwner.get(t) === token) {
+        ownedTargets.add(t);
+        sessionState.cdpSessions.set(sid, t);
+        recordTargetInfo(token, ti);
+        sendDown(m);
+      }
       else if (targetOwner.has(t)) { hiddenSessions.add(sid); }
       else bufferEvent(t, m, sid);
       return;
@@ -358,13 +665,19 @@ function attachProxy(agentWs, token) {
     if (method === 'Target.detachedFromTarget') {
       const sid = m.params.sessionId;
       if (hiddenSessions.has(sid)) { hiddenSessions.delete(sid); return; }
+      sessionState.cdpSessions.delete(sid);
       sendDown(m); return;
     }
     if (method === 'Target.targetDestroyed') {
       const t = m.params.targetId;
       if (myTabs.has(t)) { myTabs.delete(t); sendDown(m); return; }
       if (targetOwner.has(t) && targetOwner.get(t) !== token) return; // 别人的 page → 丢
-      if (targetOwner.has(t) || ownedTargets.has(t)) { ownedTargets.delete(t); targetOwner.delete(t); sendDown(m); return; }
+      if (targetOwner.has(t) || ownedTargets.has(t)) {
+        ownedTargets.delete(t);
+        removePage(token, t);
+        sendDown(m);
+        return;
+      }
       return; // 别人的 tab/未知 → 已隐藏，丢弃其 destroy
     }
     if (m.sessionId && hiddenSessions.has(m.sessionId)) return; // 隐藏页的事件 → 丢
@@ -382,65 +695,118 @@ function attachProxy(agentWs, token) {
   up.on('error', (e) => { log('upstream err', e.message); try { agentWs.close(); } catch {} });
 }
 
+function setCors(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,PUT,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'content-type');
+}
+
+function jsonResponse(res, statusCode, body) {
+  setCors(res);
+  res.statusCode = statusCode;
+  res.setHeader('Content-Type', 'application/json');
+  res.end(JSON.stringify(body));
+}
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => {
+      body += chunk;
+      if (body.length > 64 * 1024) reject(new Error('request body too large'));
+    });
+    req.on('end', () => {
+      try { resolve(body ? JSON.parse(body) : {}); } catch (error) { reject(error); }
+    });
+    req.on('error', reject);
+  });
+}
+
 // ---------------- HTTP + WS 服务 ----------------
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   const u = url.parse(req.url, true);
+  setCors(res);
+  if (req.method === 'OPTIONS') {
+    res.statusCode = 204;
+    res.end();
+    return;
+  }
   // 冒充 chrome：/s/<token>/json/version
   let m = u.pathname.match(/^\/s\/([^/]+)\/json\/version$/);
   if (m) {
     const token = m[1];
     const wsUrl = `ws://${req.headers.host}/s/${token}/devtools/browser/${crypto.randomBytes(8).toString('hex')}`;
-    res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({
+    jsonResponse(res, 200, {
       Browser: 'Chrome/146.0.7680.177', 'Protocol-Version': '1.3',
       webSocketDebuggerUrl: wsUrl,
-    }));
+    });
     return;
   }
   // 旁路：manifest
   m = u.pathname.match(/^\/s\/([^/]+)\/manifest$/);
   if (m) {
     const mf = manifestFor(m[1]);
-    res.setHeader('Content-Type', 'application/json');
-    res.statusCode = mf ? 200 : 404;
-    res.end(JSON.stringify(mf || { error: 'no such session' }));
+    jsonResponse(res, mf ? 200 : 404, mf || { error: 'no such session' });
     return;
   }
-  // 旁路：切换只读/可写  /s/<token>/viewonly?on=0|1
+  // 旁路：切换只读/可写  /s/<token>/viewonly?mode=follow|free&on=0|1
   m = u.pathname.match(/^\/s\/([^/]+)\/viewonly$/);
   if (m) {
     const on = u.query.on !== '0';
-    const ok = setViewonly(m[1], on);
-    res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({ ok, viewonly: on }));
+    const mode = u.query.mode === 'free' ? 'free' : 'follow';
+    const ok = setViewonly(m[1], on, mode);
+    jsonResponse(res, ok ? 200 : 404, { ok, mode, viewonly: on });
+    return;
+  }
+  m = u.pathname.match(/^\/s\/([^/]+)\/view-mode$/);
+  if (m && req.method === 'PUT') {
+    let body;
+    try { body = await readJsonBody(req); } catch { jsonResponse(res, 400, { error: 'bad_json' }); return; }
+    const manifest = setViewMode(m[1], body?.mode);
+    jsonResponse(res, manifest ? 200 : 400, manifest || { error: 'invalid_session_or_mode' });
+    return;
+  }
+  m = u.pathname.match(/^\/s\/([^/]+)\/free-target$/);
+  if (m && req.method === 'PUT') {
+    let body;
+    try { body = await readJsonBody(req); } catch { jsonResponse(res, 400, { error: 'bad_json' }); return; }
+    const s = sessions.get(m[1]);
+    if (!s) { jsonResponse(res, 404, { error: 'no_such_session' }); return; }
+    if (typeof body?.targetId !== 'string' || !selectFreeTarget(s, body.targetId)) {
+      jsonResponse(res, 400, { error: 'invalid_or_unready_target' });
+      return;
+    }
+    s.freeEnabled = true;
+    touch(s);
+    writeManifest(s.token);
+    jsonResponse(res, 200, manifestFor(s.token));
     return;
   }
   // 健康检查
   if (u.pathname === '/health') {
-    res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({
+    jsonResponse(res, 200, {
       ok: true,
       pid: process.pid,
       sessions: sessions.size,
       chromeBrowserWsUrl: Boolean(chromeBrowserWsUrl),
-    }));
+    });
     return;
   }
   // 总览
   if (u.pathname === '/sessions') {
-    res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify([...sessions.keys()].map(manifestFor), null, 2));
+    jsonResponse(res, 200, [...sessions.keys()].map(manifestFor));
     return;
   }
   if (u.pathname === '/' || u.pathname === '/index.html') {
     const rows = [...sessions.keys()].map((t) => {
       const mf = manifestFor(t);
-      return `<tr><td>${t.slice(0,12)}</td><td>${mf.primaryWindowId||'-'}</td><td>${mf.viewonly?'只读':'可写'}</td><td>${mf.novncUrl?`<a href="${mf.novncUrl}" target="_blank">打开</a>`:'-'}</td></tr>`;
+      return `<tr><td>${t.slice(0,12)}</td><td>${mf.botmuxSessionId||'-'}</td><td>${mf.pages.length}</td><td>${mf.mode}</td><td>${mf.novncUrl?`<a href="${mf.novncUrl}" target="_blank">Follow</a>`:'-'}</td><td>${mf.free?.novncUrl?`<a href="${mf.free.novncUrl}" target="_blank">Free</a>`:'-'}</td></tr>`;
     }).join('');
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.end(`<html><head><meta charset=utf-8><title>Agent Chrome Sessions</title></head><body style="font-family:sans-serif">
       <h2>活跃会话 (${sessions.size})</h2>
-      <table border=1 cellpadding=6><tr><th>token</th><th>window</th><th>模式</th><th>noVNC</th></tr>${rows}</table>
+      <table border=1 cellpadding=6><tr><th>token</th><th>Botmux Session</th><th>pages</th><th>mode</th><th>Follow</th><th>Free</th></tr>${rows}</table>
       </body></html>`);
     return;
   }
@@ -449,11 +815,14 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocket.Server({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
-  const m = url.parse(req.url).pathname.match(/^\/s\/([^/]+)\/devtools\//);
+  const parsed = url.parse(req.url, true);
+  const m = parsed.pathname.match(/^\/s\/([^/]+)\/devtools\//);
   if (!m) { socket.destroy(); return; }
   const token = m[1];
+  const botmuxSessionId = typeof parsed.query.botmuxSessionId === 'string' ? parsed.query.botmuxSessionId : undefined;
   wss.handleUpgrade(req, socket, head, (ws) => {
     log('agent connected token=' + token.slice(0, 8));
+    getSession(token, { botmuxSessionId });
     attachProxy(ws, token);
   });
 });

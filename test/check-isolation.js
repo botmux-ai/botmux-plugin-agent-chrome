@@ -6,7 +6,8 @@
 const { CDP, waitManifest } = require('../lib/cdp');
 const fs = require('fs');
 
-const BROKER = 'http://127.0.0.1:9300';
+const BROKER = `http://127.0.0.1:${process.env.ACS_BROKER_PORT || 9300}`;
+const MANIFESTS = process.env.ACS_MANIFESTS || '/data00/home/wanghao.muchen/agent-chrome/run/manifests';
 const TA = 'sessAAAA' + Date.now();
 const TB = 'sessBBBB' + Date.now();
 
@@ -43,8 +44,8 @@ async function openOne(token, color) {
   catch (e) { aAttachBlocked = /not owned/.test(e.message); }
 
   // manifest 是否生成
-  const mfA = fs.existsSync(`/data00/home/wanghao.muchen/agent-chrome/run/manifests/${TA}.json`);
-  const mfB = fs.existsSync(`/data00/home/wanghao.muchen/agent-chrome/run/manifests/${TB}.json`);
+  const mfA = fs.existsSync(`${MANIFESTS}/${TA}.json`);
+  const mfB = fs.existsSync(`${MANIFESTS}/${TB}.json`);
 
   console.log(JSON.stringify({
     aSeesOnlyOwn, bSeesOnlyOwn, aCloseBlocked, aAttachBlocked, mfA, mfB,

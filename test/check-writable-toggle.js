@@ -2,7 +2,7 @@
 // noVNC 默认只读，可切到可写再切回只读。
 const { CDP, httpGetJson, waitManifest } = require('../lib/cdp');
 
-const BROKER = 'http://127.0.0.1:9300';
+const BROKER = `http://127.0.0.1:${process.env.ACS_BROKER_PORT || 9300}`;
 const TOKEN = 'writable' + Date.now();
 
 (async () => {

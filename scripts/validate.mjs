@@ -34,6 +34,7 @@ if (pkg.publishConfig?.registry !== 'https://registry.npmjs.org/' || pkg.publish
 if (Object.keys(pkg.dependencies ?? {}).length !== 0) fail('runtime dependencies must be bundled into dist/');
 if (pkg.devDependencies?.['chrome-devtools-mcp'] !== '1.5.0') fail('chrome-devtools-mcp build input must stay pinned');
 if (!pkg.devDependencies?.esbuild) fail('esbuild is required to bundle the plugin runtime');
+if (!pkg.devDependencies?.react) fail('React is required to build the plugin dashboard component');
 
 for (const required of [
   'dist/package.json',
@@ -84,6 +85,11 @@ for (const tool of [
 
 const commandIndex = readJson('dist/cli/commands.json');
 if (!commandIndex.commands?.some(command => command.name === 'agent-chrome:status')) fail('missing CLI command');
+
+const dashboard = readFileSync('dist/dashboard/index.js', 'utf-8');
+for (const marker of ['ac-session-list', 'view-mode', '/api/sessions', 'free-target', 'novncUrl']) {
+  if (!dashboard.includes(marker)) fail(`dashboard is missing ${marker}`);
+}
 
 const cleanRoot = mkdtempSync(join(tmpdir(), 'agent-chrome-dist-'));
 try {

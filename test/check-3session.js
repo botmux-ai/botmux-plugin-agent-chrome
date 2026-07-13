@@ -2,10 +2,12 @@
 // 3 个并发 session（真实 puppeteer），验证：各自只见自己的页、各自独立窗口+vnc 端口。
 const puppeteer = require('puppeteer-core');
 const { httpGetJson, waitManifest } = require('../lib/cdp');
+const BROKER_PORT = process.env.ACS_BROKER_PORT || 9300;
+const BROKER = `http://127.0.0.1:${BROKER_PORT}`;
 
 async function mk(tag) {
   const token = tag + Date.now() + Math.floor(Math.random() * 1e6).toString(16);
-  const ws = `ws://127.0.0.1:9300/s/${token}/devtools/browser/x${Math.random().toString(16).slice(2)}`;
+  const ws = `ws://127.0.0.1:${BROKER_PORT}/s/${token}/devtools/browser/x${Math.random().toString(16).slice(2)}`;
   const browser = await puppeteer.connect({ browserWSEndpoint: ws, defaultViewport: null });
   const page = await browser.newPage();
   await page.goto(`data:text/html,<title>${tag}</title><body style="background:#123"><h1>${tag}</h1>`);
@@ -26,7 +28,7 @@ async function mk(tag) {
   const isolated = titles.every((t, i) => t.pageCount === 1 && t.titles[0] === S[i].tag);
 
   // 各自独立窗口 + 独立 vnc 端口
-  const mans = await Promise.all(S.map((s) => waitManifest('http://127.0.0.1:9300', s.token)));
+  const mans = await Promise.all(S.map((s) => waitManifest(BROKER, s.token)));
   const wins = new Set(mans.map((m) => m.primaryWindowId));
   const vncs = new Set(mans.map((m) => m.vncPort));
   const distinct = wins.size === 3 && vncs.size === 3;

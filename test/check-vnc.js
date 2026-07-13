@@ -4,7 +4,8 @@ const { CDP, waitManifest } = require('../lib/cdp');
 const { execSync } = require('child_process');
 const fs = require('fs');
 
-const BROKER = 'http://127.0.0.1:9300';
+const BROKER = `http://127.0.0.1:${process.env.ACS_BROKER_PORT || 9300}`;
+const DISPLAY = process.env.ACS_DISPLAY || ':77';
 const TOKEN = 'vnc' + Date.now();
 
 function sh(cmd) {
@@ -23,7 +24,7 @@ function sh(cmd) {
   const f = `/tmp/acs-test-vnc-${TOKEN}.png`;
   let shotOk = false;
   if (mf && mf.primaryWindowId) {
-    sh(`DISPLAY=:77 import -window ${mf.primaryWindowId} ${f} 2>/dev/null`);
+    sh(`DISPLAY=${DISPLAY} import -window ${mf.primaryWindowId} ${f} 2>/dev/null`);
     shotOk = fs.existsSync(f) && fs.statSync(f).size > 1000;
     try { fs.unlinkSync(f); } catch {}
   }

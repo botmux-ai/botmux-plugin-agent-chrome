@@ -13,7 +13,10 @@ const token = process.env.ACS_SESSION_TOKEN || randomUUID();
 const brokerSessionUrl = `http://127.0.0.1:${brokerPort}/s/${encodeURIComponent(token)}`;
 const mcpEntry = process.env.ACS_MCP_BIN
   || join(pluginRoot, 'vendor', 'chrome-devtools-mcp', 'src', 'bin', 'chrome-devtools-mcp.js');
-const wsEndpoint = `ws://127.0.0.1:${brokerPort}/s/${token}/devtools/browser/${randomUUID().replaceAll('-', '')}`;
+const sessionQuery = process.env.BOTMUX_SESSION_ID
+  ? `?botmuxSessionId=${encodeURIComponent(process.env.BOTMUX_SESSION_ID)}`
+  : '';
+const wsEndpoint = `ws://127.0.0.1:${brokerPort}/s/${token}/devtools/browser/${randomUUID().replaceAll('-', '')}${sessionQuery}`;
 
 const LOCAL_TOOLS = [
   {
@@ -24,7 +27,13 @@ const LOCAL_TOOLS = [
   {
     name: 'browser_session_get_vnc_url',
     description: 'Get the noVNC URL for viewing or taking over this MCP session browser window.',
-    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        mode: { type: 'string', enum: ['follow', 'free'], default: 'follow' },
+      },
+      additionalProperties: false,
+    },
   },
   {
     name: 'browser_session_set_writable',
@@ -33,6 +42,7 @@ const LOCAL_TOOLS = [
       type: 'object',
       properties: {
         writable: { type: 'boolean', description: 'True allows noVNC input; false returns to view-only mode.' },
+        mode: { type: 'string', enum: ['follow', 'free'], default: 'follow' },
       },
       required: ['writable'],
       additionalProperties: false,
@@ -117,6 +127,7 @@ async function fetchJson(url) {
 
 function safeManifest(manifest) {
   return {
+    botmuxSessionId: manifest.botmuxSessionId || null,
     display: manifest.DISPLAY || display,
     geometry: manifest.geometry || null,
     windowIds: Array.isArray(manifest.windowIds) ? manifest.windowIds : [],
@@ -125,6 +136,18 @@ function safeManifest(manifest) {
     novncPort: manifest.novncPort || null,
     novncUrl: manifest.novncUrl || null,
     viewonly: manifest.viewonly !== false,
+    mode: manifest.mode === 'free' ? 'free' : 'follow',
+    agentActiveTargetId: manifest.agentActiveTargetId || null,
+    pages: Array.isArray(manifest.pages) ? manifest.pages.map(page => ({
+      targetId: page.targetId,
+      windowId: page.windowId,
+      title: page.title || '',
+      url: page.url || '',
+      createdAt: page.createdAt || null,
+      lastActiveAt: page.lastActiveAt || null,
+    })) : [],
+    follow: manifest.follow || null,
+    free: manifest.free || { enabled: false },
     updatedAt: manifest.updatedAt || null,
   };
 }
@@ -181,14 +204,21 @@ async function callLocalTool(name, rawArgs) {
   }
   if (name === 'browser_session_get_vnc_url') {
     const current = await manifest();
-    if (!current.novncUrl) throw new Error('The noVNC view is not ready yet. Open a page first.');
-    return textResult(current.novncUrl, { structuredContent: { url: current.novncUrl, viewonly: current.viewonly } });
+    const mode = args.mode === 'free' ? 'free' : 'follow';
+    const view = mode === 'free' ? current.free : current.follow;
+    if (!view?.novncUrl) {
+      throw new Error(mode === 'free'
+        ? 'Free browsing is not active for this session. Enable it from the Agent Chrome dashboard first.'
+        : 'The noVNC view is not ready yet. Open a page first.');
+    }
+    return textResult(view.novncUrl, { structuredContent: { mode, url: view.novncUrl, viewonly: view.viewonly !== false } });
   }
   if (name === 'browser_session_set_writable') {
     if (typeof args.writable !== 'boolean') throw new Error('writable must be a boolean');
-    const state = await fetchJson(`${brokerSessionUrl}/viewonly?on=${args.writable ? '0' : '1'}`);
+    const mode = args.mode === 'free' ? 'free' : 'follow';
+    const state = await fetchJson(`${brokerSessionUrl}/viewonly?mode=${mode}&on=${args.writable ? '0' : '1'}`);
     if (!state.ok) throw new Error('Agent Chrome could not update the noVNC interaction mode');
-    const result = { writable: state.viewonly === false, viewonly: state.viewonly !== false };
+    const result = { mode, writable: state.viewonly === false, viewonly: state.viewonly !== false };
     return textResult(result.writable ? 'noVNC input enabled' : 'noVNC returned to view-only mode', { structuredContent: result });
   }
   if (name === 'browser_session_screenshot') {
