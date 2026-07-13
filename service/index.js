@@ -4,7 +4,6 @@ module.exports = {
   mode: 'manual',
   port,
   pm2: {
-    name: 'agent-chrome',
     script: './service/runner.js',
     env: {
       ACS_BROKER_PORT: String(port),
@@ -18,4 +17,3 @@ module.exports = {
     };
   },
 };
-

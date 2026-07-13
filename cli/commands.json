@@ -1,9 +1,0 @@
-{
-  "schemaVersion": 1,
-  "commands": [
-    {
-      "name": "agent-chrome:status",
-      "description": "Show Agent Chrome service status URL."
-    }
-  ]
-}

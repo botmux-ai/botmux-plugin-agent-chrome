@@ -19,6 +19,12 @@ rm -f "$ACS_PROFILE"/Singleton* 2>/dev/null || true
 export DISPLAY="$ACS_DISPLAY"
 export TMPDIR="$ACS_TMP"
 
+[ -x "$ACS_CHROME_BIN" ] || {
+  echo "[chrome] executable not found: $ACS_CHROME_BIN" >&2
+  echo "[chrome] set ACS_CHROME_BIN to a Chrome/Chromium executable" >&2
+  exit 1
+}
+
 echo "[chrome] launching headful chrome on $ACS_DISPLAY port $ACS_CHROME_PORT"
 "$ACS_CHROME_BIN" \
   --no-sandbox \

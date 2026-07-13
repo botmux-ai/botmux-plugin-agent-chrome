@@ -1,7 +1,0 @@
-{
-  "name": "agent-chrome",
-  "command": [
-    "./bin/mcp-launch.sh"
-  ]
-}
-
