@@ -28,6 +28,9 @@ if (!pkg.keywords?.includes('botmux-plugin')) fail('missing botmux-plugin keywor
 if (pkg.botmux?.id !== 'agent-chrome') fail('invalid botmux id');
 if (pkg.botmux?.service?.mode !== 'auto') fail('agent-chrome service should start automatically with botmux');
 if (pkg.files?.length !== 1 || pkg.files[0] !== 'dist/') fail('package files must publish only dist/');
+if (pkg.publishConfig?.registry !== 'https://registry.npmjs.org/' || pkg.publishConfig?.access !== 'public') {
+  fail('agent-chrome must publish publicly to npmjs');
+}
 if (Object.keys(pkg.dependencies ?? {}).length !== 0) fail('runtime dependencies must be bundled into dist/');
 if (pkg.devDependencies?.['chrome-devtools-mcp'] !== '1.5.0') fail('chrome-devtools-mcp build input must stay pinned');
 if (!pkg.devDependencies?.esbuild) fail('esbuild is required to bundle the plugin runtime');
