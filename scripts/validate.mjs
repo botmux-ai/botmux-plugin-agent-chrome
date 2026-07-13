@@ -26,7 +26,7 @@ const pkg = readJson('package.json');
 if (pkg.name !== '@botmux-ai/plugin-agent-chrome') fail('invalid package name');
 if (!pkg.keywords?.includes('botmux-plugin')) fail('missing botmux-plugin keyword');
 if (pkg.botmux?.id !== 'agent-chrome') fail('invalid botmux id');
-if (pkg.botmux?.service?.mode !== 'manual') fail('agent-chrome service should be manual by default');
+if (pkg.botmux?.service?.mode !== 'auto') fail('agent-chrome service should start automatically with botmux');
 if (pkg.files?.length !== 1 || pkg.files[0] !== 'dist/') fail('package files must publish only dist/');
 if (Object.keys(pkg.dependencies ?? {}).length !== 0) fail('runtime dependencies must be bundled into dist/');
 if (pkg.devDependencies?.['chrome-devtools-mcp'] !== '1.5.0') fail('chrome-devtools-mcp build input must stay pinned');
@@ -75,6 +75,7 @@ try {
   const handlers = cleanRequire(join(cleanRoot, 'cli', 'index.js'));
   if (typeof handlers?.['agent-chrome:status']?.run !== 'function') fail('clean dist CLI bundle is not loadable');
   const service = cleanRequire(join(cleanRoot, 'service', 'index.js'));
+  if (service?.mode !== 'auto') fail('clean dist service should use auto mode');
   if (service?.pm2?.script !== './service/runner.js') fail('clean dist service bundle is not loadable');
 
   const vendoredMcp = spawnSync(process.execPath, [

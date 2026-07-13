@@ -1,7 +1,7 @@
 const port = Number(process.env.ACS_BROKER_PORT || 9300);
 
 module.exports = {
-  mode: 'manual',
+  mode: 'auto',
   port,
   pm2: {
     script: './service/runner.js',

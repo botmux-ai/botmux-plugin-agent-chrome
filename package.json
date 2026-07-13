@@ -23,7 +23,7 @@
     "id": "agent-chrome",
     "displayName": "Agent Chrome",
     "service": {
-      "mode": "manual"
+      "mode": "auto"
     }
   },
   "files": [

@@ -61,11 +61,13 @@ After enable, botmux materializes:
 - MCP server: `agent-chrome`
 - CLI command: `botmux agent-chrome:status`
 - Dashboard page under Plugins
-- Manual PM2 service controlled by CLI/Dashboard
+- Auto PM2 service that can also be controlled by CLI/Dashboard
 
-The service is `manual` by default because it runs a full Xvfb + Chrome + broker
-stack. It does not start automatically on `botmux start`; users start it from
-Dashboard or with `botmux plugin service start agent-chrome`.
+The service uses `auto` mode. `botmux start` and the start phase of
+`botmux restart` ensure the Xvfb + Chrome + broker stack is running. A normal
+`botmux stop` leaves it running; use `botmux stop --with-plugin` when the plugin
+service should stop with the core. It remains controllable from Dashboard and
+with `botmux plugin service start|stop|restart agent-chrome`.
 
 Start a new Codex/agent session after enabling the plugin so it reloads the
 `agent-chrome` MCP configuration and skill.
