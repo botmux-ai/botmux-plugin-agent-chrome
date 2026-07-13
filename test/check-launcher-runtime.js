@@ -18,9 +18,15 @@ input.on('line', line => {
       id: request.id,
       result: {
         protocolVersion: request.params.protocolVersion,
-        capabilities: {},
+        capabilities: { tools: {} },
         serverInfo: { name: 'agent-chrome-launcher-smoke', version: '1.0.0' }
       }
+    }) + '\\n');
+  } else if (request.method === 'tools/list') {
+    process.stdout.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: request.id,
+      result: { tools: [{ name: 'fake_chrome_tool', description: 'fake', inputSchema: { type: 'object' } }] }
     }) + '\\n');
   }
 });
@@ -49,9 +55,16 @@ function runLauncher(extraEnv, sendInitialize) {
 
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
+    let requestedTools = false;
     child.stdout.on('data', chunk => {
       stdout += chunk;
-      if (sendInitialize && stdout.includes('agent-chrome-launcher-smoke')) child.kill('SIGTERM');
+      if (sendInitialize && !requestedTools && stdout.includes('agent-chrome-launcher-smoke')) {
+        requestedTools = true;
+        child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }) + '\n');
+      }
+      if (sendInitialize && stdout.includes('fake_chrome_tool') && stdout.includes('browser_session_info')) {
+        child.kill('SIGTERM');
+      }
     });
     child.stderr.on('data', chunk => { stderr += chunk; });
     child.on('error', reject);
@@ -86,6 +99,9 @@ async function main() {
   const handshake = await runLauncher({ ACS_NODE_BIN: process.execPath }, true);
   if (!handshake.stdout.includes('agent-chrome-launcher-smoke')) {
     throw new Error(`launcher handshake failed: ${handshake.stderr || handshake.stdout}`);
+  }
+  if (!handshake.stdout.includes('fake_chrome_tool') || !handshake.stdout.includes('browser_session_info')) {
+    throw new Error(`composite MCP did not merge downstream and session tools: ${handshake.stderr || handshake.stdout}`);
   }
 
   const incompatible = await runLauncher({ ACS_NODE_BIN: '/usr/bin/false' }, false);

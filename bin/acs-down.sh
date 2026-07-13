@@ -21,5 +21,4 @@ if [ "${1:-}" = "--all" ]; then
 fi
 
 rm -f "$ACS_MANIFESTS"/*.json 2>/dev/null
-rm -f "$ACS_RUN"/sessions/by-pid/*.token 2>/dev/null
 echo "done. (默认保留 chrome/display；加 --all 连 chrome 一起停)"

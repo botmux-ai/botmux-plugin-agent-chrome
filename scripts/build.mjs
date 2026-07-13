@@ -127,6 +127,7 @@ await Promise.all([
   bundleNode(join(repoRoot, 'cli', 'index.js'), join(outputRoot, 'cli', 'index.js')),
   bundleNode(join(repoRoot, 'service', 'index.js'), join(outputRoot, 'service', 'index.js')),
   bundleNode(join(repoRoot, 'service', 'runner.js'), join(outputRoot, 'service', 'runner.js')),
+  bundleNode(join(repoRoot, 'src', 'mcp', 'server.js'), join(outputRoot, 'mcp', 'server.js')),
   bundleNode(join(repoRoot, 'bin', 'broker.js'), join(outputRoot, 'bin', 'broker.js')),
   bundleNode(join(repoRoot, 'bin', 'open-session.js'), join(outputRoot, 'bin', 'open-session.js')),
   bundleBrowser(join(repoRoot, 'dashboard', 'index.js'), join(outputRoot, 'dashboard', 'index.js')),

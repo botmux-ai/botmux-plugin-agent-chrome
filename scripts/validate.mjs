@@ -45,6 +45,7 @@ for (const required of [
   'dist/cli/commands.json',
   'dist/dashboard/index.js',
   'dist/mcp/index.json',
+  'dist/mcp/server.js',
   'dist/service/index.js',
   'dist/service/runner.js',
   'dist/skills/agent-chrome/SKILL.md',
@@ -63,10 +64,23 @@ const mcp = readJson('dist/mcp/index.json');
 if (mcp.name !== undefined || mcp.transport !== 'stdio') fail('invalid single MCP config');
 if (!Array.isArray(mcp.command) || mcp.command.length !== 1 || mcp.command[0] !== './bin/mcp-launch.sh') fail('invalid MCP command');
 const mcpLauncher = readFileSync('dist/bin/mcp-launch.sh', 'utf-8');
-if (!mcpLauncher.includes('vendor/chrome-devtools-mcp/src/bin/chrome-devtools-mcp.js')) fail('MCP launcher must use the bundled runtime');
+if (!mcpLauncher.includes('mcp/server.js')) fail('MCP launcher must use the composite MCP server');
 if (mcpLauncher.includes('node_modules/.bin/chrome-devtools-mcp')) fail('MCP launcher must not depend on node_modules');
 if (!mcpLauncher.includes('ACS_NODE_BIN')) fail('MCP launcher must support an explicit Node.js runtime');
 if (!mcpLauncher.includes('Node.js >=20.19.0')) fail('MCP launcher must enforce the MCP Node.js requirement');
+const mcpServer = readFileSync('dist/mcp/server.js', 'utf-8');
+if (!mcpServer.includes('"vendor"') || !mcpServer.includes('"chrome-devtools-mcp"')) {
+  fail('composite MCP server must proxy the bundled Chrome DevTools MCP');
+}
+for (const tool of [
+  'browser_session_info',
+  'browser_session_get_vnc_url',
+  'browser_session_set_writable',
+  'browser_session_screenshot',
+  'browser_session_activate',
+]) {
+  if (!mcpServer.includes(tool)) fail(`composite MCP server is missing ${tool}`);
+}
 
 const commandIndex = readJson('dist/cli/commands.json');
 if (!commandIndex.commands?.some(command => command.name === 'agent-chrome:status')) fail('missing CLI command');

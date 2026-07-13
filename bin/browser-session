@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# agent 侧受限网关：给 agent（在 Bash 里）取自己 session 的环境信息、
-# 并把任何 X11 操作限定到自己的窗口——避免裸 DISPLAY 绕过 broker 隔离。
+# Operator-only diagnostics helper. Agents use the structured browser_session_*
+# MCP tools instead. An explicit token is required so this script never guesses a
+# session from a process tree.
 #
 # 用法：
 #   browser-session info                     # 打印自己的 DISPLAY/窗口/noVNC URL（JSON）
@@ -12,22 +13,8 @@
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
 
-# 反查本 session 的 token：沿自己的父进程链向上，找 by-pid/<ancestor>.token
-find_token() {
-  if [ -n "${ACS_SESSION_TOKEN:-}" ]; then echo "$ACS_SESSION_TOKEN"; return 0; fi
-  local pid=$$
-  for _ in $(seq 1 40); do
-    [ "$pid" -le 1 ] && break
-    local f="$ACS_RUN/sessions/by-pid/${pid}.token"
-    [ -f "$f" ] && { cat "$f"; return 0; }
-    pid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null) || break
-    [ -z "$pid" ] && break
-  done
-  return 1
-}
-
-TOKEN="$(find_token || true)"
-[ -z "$TOKEN" ] && { echo "ERROR: 找不到本 session 的 token（不在受管 MCP 会话内？）" >&2; exit 2; }
+TOKEN="${ACS_SESSION_TOKEN:-}"
+[ -z "$TOKEN" ] && { echo "ERROR: set ACS_SESSION_TOKEN for operator diagnostics; agents should use browser_session_* MCP tools" >&2; exit 2; }
 
 manifest() { curl -fsS "http://127.0.0.1:${ACS_BROKER_PORT}/s/${TOKEN}/manifest"; }
 field() { manifest | python3 -c "import sys,json;print(json.load(sys.stdin).get('$1') or '')"; }

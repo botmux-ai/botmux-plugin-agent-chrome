@@ -458,20 +458,6 @@ server.on('upgrade', (req, socket, head) => {
   });
 });
 
-// 周期回收：清理已无活跃 session 的 by-pid token 文件（孤儿）
-function reap() {
-  try {
-    const dir = path.join(CFG.manifests, '..', 'sessions', 'by-pid');
-    if (fs.existsSync(dir)) {
-      for (const f of fs.readdirSync(dir)) {
-        const pid = parseInt(f, 10);
-        if (pid && !fs.existsSync(`/proc/${pid}`)) { try { fs.unlinkSync(path.join(dir, f)); } catch {} }
-      }
-    }
-  } catch {}
-}
-setInterval(reap, 30000);
-
 (async () => {
   await ensureChrome();
   server.listen(CFG.brokerPort, () => log(`listening on :${CFG.brokerPort}  (host ${HOST})`));

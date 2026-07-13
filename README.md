@@ -95,7 +95,7 @@ ACS provides:
 - Per-session broker tokens and target filtering.
 - Per-session kiosk windows and noVNC views.
 - MCP connection through `bin/mcp-launch.sh`.
-- Restricted browser helper through `bin/browser-session`.
+- Structured native browser-session tools through the Agent Chrome MCP.
 
 Default ports:
 
@@ -114,14 +114,19 @@ curl http://127.0.0.1:9300/health
 curl http://127.0.0.1:9300/sessions
 ```
 
-Agent-side helper:
+The Agent Chrome MCP adds these session-scoped tools alongside the standard
+Chrome DevTools tools:
 
-```bash
-"$HOME/.botmux/plugins/agent-chrome/dist/bin/browser-session" info
-"$HOME/.botmux/plugins/agent-chrome/dist/bin/browser-session" vnc
-"$HOME/.botmux/plugins/agent-chrome/dist/bin/browser-session" writable on
-"$HOME/.botmux/plugins/agent-chrome/dist/bin/browser-session" screenshot /tmp/browser.png
-```
+- `browser_session_info`
+- `browser_session_get_vnc_url`
+- `browser_session_set_writable`
+- `browser_session_screenshot`
+- `browser_session_activate`
+- `browser_session_send_keys`
+- `browser_session_click`
+
+`bin/browser-session` remains available for operator diagnostics only and
+requires an explicit `ACS_SESSION_TOKEN`. Agents should use the MCP tools.
 
 Stop or restart the browser stack with:
 

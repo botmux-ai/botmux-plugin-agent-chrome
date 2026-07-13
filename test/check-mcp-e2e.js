@@ -3,9 +3,10 @@
 // chrome-devtools-mcp，用最小 MCP(JSON-RPC over stdio) 客户端驱动它：
 // initialize → new_page → list_pages，验证整条 CLI→wrapper→MCP→broker→chrome 链路。
 const { spawn, execSync } = require('child_process');
+const { existsSync, rmSync } = require('fs');
 const path = require('path');
 
-const WRAPPER = path.join(__dirname, '..', 'bin', 'mcp-launch.sh');
+const WRAPPER = path.join(__dirname, '..', 'dist', 'bin', 'mcp-launch.sh');
 const FIXED_TOKEN = 'e2e' + Date.now();
 
 const child = spawn('bash', [WRAPPER], {
@@ -44,30 +45,69 @@ const txt = (r) => (r.result && r.result.content || []).map((c) => c.text || '')
   await rpc('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'e2e', version: '1' } });
   notify('notifications/initialized', {});
 
+  const tools = await rpc('tools/list', {});
+  const toolNames = new Set((tools.result?.tools || []).map(tool => tool.name));
+  const requiredSessionTools = [
+    'browser_session_info',
+    'browser_session_get_vnc_url',
+    'browser_session_set_writable',
+    'browser_session_screenshot',
+    'browser_session_activate',
+  ];
+  const toolsMerged = toolNames.has('new_page') && requiredSessionTools.every(name => toolNames.has(name));
+  console.log('composite tools merged:', toolsMerged);
+
   // 新开一个页
-  const np = await rpc('tools/call', { name: 'new_page', arguments: { url: 'https://example.com/' } });
-  console.log('new_page ok:', /example\.com|Example/.test(txt(np)) || txt(np).slice(0, 60));
+  const np = await rpc('tools/call', { name: 'new_page', arguments: { url: 'about:blank' } });
+  const newPageOk = /about:blank/.test(txt(np));
+  console.log('new_page ok:', newPageOk);
 
   // 列出页面（应只有本 session 的）
   const lp = await rpc('tools/call', { name: 'list_pages', arguments: {} });
   const listed = txt(lp);
-  const exampleCount = (listed.match(/example\.com/g) || []).length;
-  console.log('list_pages 提到 example.com 次数:', exampleCount);
+  const pageListed = /about:blank/.test(listed);
+  console.log('list_pages includes page:', pageListed);
 
   // broker 侧应看到本 token 的连接 + manifest
   let mf = {};
   for (let i=0;i<60;i++){ try { mf = JSON.parse(execSync(`curl -fsS http://127.0.0.1:9300/s/${FIXED_TOKEN}/manifest`, {encoding:'utf8'})); if (mf.primaryWindowId) break; } catch {} await new Promise(r=>setTimeout(r,150)); }
   console.log('manifest novncUrl:', mf.novncUrl || '(none)');
 
-  // browser-session helper 能否用同 token 取到信息
-  let helperOk = false;
-  try {
-    const info = execSync(`ACS_SESSION_TOKEN=${FIXED_TOKEN} ${path.join(__dirname, '..', 'bin', 'browser-session')} vnc`, { encoding: 'utf8' }).trim();
-    helperOk = /vnc.html/.test(info);
-    console.log('browser-session vnc:', info);
-  } catch (e) { console.log('helper err', e.message); }
+  const sessionInfo = await rpc('tools/call', { name: 'browser_session_info', arguments: {} });
+  const infoText = txt(sessionInfo);
+  const infoOk = /primaryWindowId/.test(infoText) && !infoText.includes(FIXED_TOKEN);
+  console.log('session info sanitized:', infoOk);
 
-  const pass = /example/i.test(listed) && mf.novncUrl && helperOk;
+  const vnc = await rpc('tools/call', { name: 'browser_session_get_vnc_url', arguments: {} });
+  const vncOk = /vnc\.html/.test(txt(vnc));
+  console.log('session vnc:', vncOk);
+
+  const writable = await rpc('tools/call', { name: 'browser_session_set_writable', arguments: { writable: true } });
+  const readonly = await rpc('tools/call', { name: 'browser_session_set_writable', arguments: { writable: false } });
+  const writableOk = /enabled/.test(txt(writable)) && /view-only/.test(txt(readonly));
+  console.log('session writable toggle:', writableOk);
+
+  const shot = path.join('/tmp', `agent-chrome-mcp-${FIXED_TOKEN}.png`);
+  const screenshot = await rpc('tools/call', { name: 'browser_session_screenshot', arguments: { filePath: shot } });
+  const screenshotOk = existsSync(shot) && /Saved native browser window screenshot/.test(txt(screenshot));
+  console.log('session native screenshot:', screenshotOk);
+  rmSync(shot, { force: true });
+
+  const activated = await rpc('tools/call', { name: 'browser_session_activate', arguments: {} });
+  const keys = await rpc('tools/call', { name: 'browser_session_send_keys', arguments: { keys: ['Escape'] } });
+  const click = await rpc('tools/call', { name: 'browser_session_click', arguments: { x: 10, y: 10 } });
+  const nativeInputOk = /Activated/.test(txt(activated))
+    && /Sent 1 key/.test(txt(keys))
+    && /Clicked/.test(txt(click));
+  console.log('session bounded native input:', nativeInputOk);
+
+  const unsafeKeys = await rpc('tools/call', { name: 'browser_session_send_keys', arguments: { keys: ['--window', '1'] } });
+  const outsideClick = await rpc('tools/call', { name: 'browser_session_click', arguments: { x: 999999, y: 999999 } });
+  const nativeInputBounded = unsafeKeys.result?.isError === true && outsideClick.result?.isError === true;
+  console.log('session native input rejects escape attempts:', nativeInputBounded);
+
+  const pass = toolsMerged && newPageOk && pageListed && mf.novncUrl
+    && infoOk && vncOk && writableOk && screenshotOk && nativeInputOk && nativeInputBounded;
   console.log(pass ? 'PASS: 端到端（真实 MCP）链路打通且被管理' : 'FAIL');
 
   child.kill('SIGTERM');
