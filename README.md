@@ -35,6 +35,17 @@ then from common Chrome/Chromium command names. Override it when needed:
 export ACS_CHROME_BIN=/path/to/chrome
 ```
 
+## Install From npm
+
+Botmux expands the official short id to `@botmux-ai/plugin-agent-chrome`:
+
+```bash
+botmux plugin install agent-chrome
+botmux plugin enable agent-chrome
+botmux plugin service start agent-chrome
+botmux agent-chrome:status
+```
+
 ## Install From The `.tgz`
 
 Use a `file:` URL so Botmux lets npm unpack the tarball and persist only its
