@@ -4,6 +4,8 @@ Botmux plugin packaging for ACS — Agent Chrome Stack. It provides one shared
 headful Chrome instance, per-session CDP isolation, and per-session noVNC views
 for agent CLIs.
 
+GitHub: https://github.com/botmux-ai/botmux-plugin-agent-chrome
+
 The original ACS scripts are kept under `bin/` and `lib/`. Runtime state such as
 Chrome profile, logs, screenshots, and manifests is intentionally excluded from
 this repository and generated under the installed plugin directory.
