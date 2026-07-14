@@ -90,13 +90,16 @@ for (const marker of ['list_pages', 'new_page', 'sessionId', '/bind', 'No active
 }
 
 const broker = readFileSync('dist/bin/broker.js', 'utf-8');
-for (const marker of ['.agent-chrome', 'runtimeDir', 'process.chdir', 'websockify exited with', 'transportBindings', 'reconnectGraceMs']) {
+for (const marker of ['.agent-chrome', 'websockify exited with', 'transportBindings', 'reconnectGraceMs']) {
   if (!broker.includes(marker)) fail(`broker is missing runtime lifecycle marker: ${marker}`);
+}
+if (broker.includes('process.chdir(') || broker.includes('cwd: CFG.runtimeDir')) {
+  fail('broker and VNC subprocesses must keep the plugin runtime working directory');
 }
 const runtimeEnv = readFileSync('dist/bin/env.sh', 'utf-8');
 if (!runtimeEnv.includes('/.agent-chrome')) fail('runtime data must default to ~/.agent-chrome');
 const stackLauncher = readFileSync('dist/bin/acs-up.sh', 'utf-8');
-if (!stackLauncher.includes('cd "$ACS_RUN"')) fail('broker must start from ACS_RUN');
+if (stackLauncher.includes('cd "$ACS_RUN"')) fail('stack launcher must not migrate process cwd into the data directory');
 
 const commandIndex = readJson('dist/cli/commands.json');
 if (!commandIndex.commands?.some(command => command.name === 'agent-chrome:status')) fail('missing CLI command');
@@ -114,10 +117,8 @@ try {
   if (typeof handlers?.['agent-chrome:status']?.run !== 'function') fail('clean dist CLI bundle is not loadable');
   const service = cleanRequire(join(cleanRoot, 'service', 'index.js'));
   if (service?.mode !== 'auto') fail('clean dist service should use auto mode');
-  if (service?.pm2?.script !== join(cleanRoot, 'service', 'runner.js')) fail('clean dist service bundle is not loadable');
-  if (service?.pm2?.cwd !== join(service?.pm2?.env?.ACS_DATA_ROOT ?? '', 'run') || service.pm2.cwd.startsWith(cleanRoot)) {
-    fail('service cwd must use the persistent Agent Chrome runtime directory');
-  }
+  if (service?.pm2?.script !== './service/runner.js') fail('clean dist service bundle is not loadable');
+  if (service?.pm2?.cwd !== undefined) fail('service cwd must remain the plugin runtime directory managed by Botmux');
 
   const vendoredMcp = spawnSync(process.execPath, [
     join(cleanRoot, 'vendor', 'chrome-devtools-mcp', 'src', 'bin', 'chrome-devtools-mcp.js'),

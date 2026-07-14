@@ -82,6 +82,17 @@ The service uses `auto` mode. `botmux start` and the start phase of
 service should stop with the core. It remains controllable from Dashboard and
 with `botmux plugin service start|stop|restart agent-chrome`.
 
+Profile, session manifests, and logs live under `~/.agent-chrome` by default,
+separate from the replaceable plugin runtime. Before reinstalling, updating, or
+uninstalling the plugin, stop its service explicitly:
+
+```bash
+botmux plugin service stop agent-chrome
+```
+
+Botmux rejects the lifecycle operation while the service is still running; it
+does not stop the service implicitly.
+
 Start a new Codex/agent session after enabling the plugin so it reloads the
 `agent-chrome` MCP configuration and skill.
 

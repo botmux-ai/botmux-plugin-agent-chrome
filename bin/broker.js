@@ -35,14 +35,11 @@ const CFG = {
   novncWeb: process.env.ACS_NOVNC_WEB || '/usr/share/novnc',
   manifests: process.env.ACS_MANIFESTS || path.join(DATA_ROOT, 'run', 'manifests'),
   logs: process.env.ACS_LOGS || path.join(DATA_ROOT, 'logs'),
-  runtimeDir: process.env.ACS_RUN || path.join(DATA_ROOT, 'run'),
   reconnectGraceMs: parseInt(process.env.ACS_RECONNECT_GRACE_MS || '30000', 10),
 };
 
-fs.mkdirSync(CFG.runtimeDir, { recursive: true });
 fs.mkdirSync(CFG.manifests, { recursive: true });
 fs.mkdirSync(CFG.logs, { recursive: true });
-process.chdir(CFG.runtimeDir);
 
 function log(...a) { console.log(new Date().toISOString(), '[broker]', ...a); }
 function xdo(cmd) { return execSync(`DISPLAY=${CFG.display} ${cmd}`, { encoding: 'utf8' }).trim(); }
@@ -235,7 +232,6 @@ function x11vncArgs(view) {
 function spawnX11vnc(view) {
   const logFile = `${CFG.logs}/x11vnc-${view.vncPort}.log`;
   return spawn('x11vnc', x11vncArgs(view), {
-    cwd: CFG.runtimeDir,
     stdio: ['ignore', fs.openSync(logFile, 'a'), fs.openSync(logFile, 'a')],
   });
 }
@@ -313,7 +309,6 @@ function startVnc(s, kind, page) {
     `0.0.0.0:${view.novncPort}`,
     `localhost:${view.vncPort}`,
   ], {
-    cwd: CFG.runtimeDir,
     stdio: ['ignore', fs.openSync(novncLog, 'a'), fs.openSync(novncLog, 'a')],
   });
   view.novncUrl = `http://${HOST}:${view.novncPort}/vnc.html?autoconnect=true&reconnect=true&reconnect_delay=1000&resize=scale&path=websockify`;
