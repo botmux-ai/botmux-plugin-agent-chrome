@@ -16,12 +16,16 @@ const http = require('http');
 const url = require('url');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const crypto = require('crypto');
 const net = require('net');
 const { execSync, spawn } = require('child_process');
 const WebSocket = require('ws');
 const { CDP, httpGetJson } = require('../lib/cdp');
 
+const DATA_ROOT = process.env.ACS_DATA_ROOT
+  || process.env.AGENT_CHROME_HOME
+  || path.join(os.homedir(), '.agent-chrome');
 const CFG = {
   display: process.env.ACS_DISPLAY || ':77',
   chromePort: parseInt(process.env.ACS_CHROME_PORT || '9223', 10),
@@ -29,9 +33,16 @@ const CFG = {
   vncBase: parseInt(process.env.ACS_VNC_BASE || '5910', 10),
   novncBase: parseInt(process.env.ACS_NOVNC_BASE || '6090', 10),
   novncWeb: process.env.ACS_NOVNC_WEB || '/usr/share/novnc',
-  manifests: process.env.ACS_MANIFESTS || '/data00/home/wanghao.muchen/agent-chrome/run/manifests',
-  logs: process.env.ACS_LOGS || '/data00/home/wanghao.muchen/agent-chrome/logs',
+  manifests: process.env.ACS_MANIFESTS || path.join(DATA_ROOT, 'run', 'manifests'),
+  logs: process.env.ACS_LOGS || path.join(DATA_ROOT, 'logs'),
+  runtimeDir: process.env.ACS_RUN || path.join(DATA_ROOT, 'run'),
+  reconnectGraceMs: parseInt(process.env.ACS_RECONNECT_GRACE_MS || '30000', 10),
 };
+
+fs.mkdirSync(CFG.runtimeDir, { recursive: true });
+fs.mkdirSync(CFG.manifests, { recursive: true });
+fs.mkdirSync(CFG.logs, { recursive: true });
+process.chdir(CFG.runtimeDir);
 
 function log(...a) { console.log(new Date().toISOString(), '[broker]', ...a); }
 function xdo(cmd) { return execSync(`DISPLAY=${CFG.display} ${cmd}`, { encoding: 'utf8' }).trim(); }
@@ -43,8 +54,9 @@ const HOST = hostHint();
 
 let chromeBrowserWsUrl = null;       // 真 Chrome 的 browser ws
 let control = null;                  // broker 自用控制连接（provisioning）
-const targetOwner = new Map();       // targetId -> token（全局归属表）
-const sessions = new Map();          // token -> session 状态
+const targetOwner = new Map();       // targetId -> stable session key
+const sessions = new Map();          // stable session key -> session state
+const transportBindings = new Map(); // MCP transport token -> stable session key
 const usedPortSlots = new Set();     // Follow / Free VNC 共用端口池
 const mappedWindows = new Set();     // 已分配的 X11 window-id（全局，供"新窗口差集"映射）
 let provChain = Promise.resolve();   // provisioning 串行化队列（避免并发映射歧义）
@@ -80,6 +92,7 @@ function getSession(token, metadata = {}) {
   if (!s) {
     s = {
       token,
+      accessToken: metadata.accessToken || token,
       botmuxSessionId: null,
       pages: new Map(),
       cdpSessions: new Map(),
@@ -92,14 +105,54 @@ function getSession(token, metadata = {}) {
       createdAt: Date.now(),
       updatedAt: Date.now(),
       connCount: 0,
+      teardownTimer: null,
     };
     sessions.set(token, s);
   }
+  if (!s.accessToken && typeof metadata.accessToken === 'string') s.accessToken = metadata.accessToken;
   if (typeof metadata.botmuxSessionId === 'string' && metadata.botmuxSessionId.trim()) {
     s.botmuxSessionId = metadata.botmuxSessionId.trim().slice(0, 256);
     s.updatedAt = Date.now();
   }
   return s;
+}
+
+function normalizeSessionId(value) {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)) {
+    throw new Error('invalid_session_id');
+  }
+  return value;
+}
+
+function resolveSessionKey(transportToken) {
+  const bound = transportBindings.get(transportToken);
+  if (bound) return bound;
+  const legacy = sessions.get(transportToken);
+  return legacy?.accessToken === transportToken && !legacy.botmuxSessionId ? transportToken : null;
+}
+
+function resolveWebSocketSessionKey(transportToken) {
+  const bound = transportBindings.get(transportToken);
+  if (bound) return bound;
+  const existing = sessions.get(transportToken);
+  if (existing?.botmuxSessionId) return null;
+  return transportToken;
+}
+
+function bindTransport(transportToken, rawSessionId) {
+  const sessionId = normalizeSessionId(rawSessionId);
+  const existing = transportBindings.get(transportToken);
+  if (existing && existing !== sessionId) throw new Error('transport_already_bound');
+  transportBindings.set(transportToken, sessionId);
+  const session = getSession(sessionId, { accessToken: transportToken, botmuxSessionId: sessionId });
+  if (session.teardownTimer) {
+    clearTimeout(session.teardownTimer);
+    session.teardownTimer = null;
+  }
+  touch(session);
+  writeManifest(sessionId);
+  if (session.connCount <= 0) scheduleTeardown(sessionId);
+  return sessionId;
 }
 
 function touch(s) { s.updatedAt = Date.now(); }
@@ -182,7 +235,27 @@ function x11vncArgs(view) {
 function spawnX11vnc(view) {
   const logFile = `${CFG.logs}/x11vnc-${view.vncPort}.log`;
   return spawn('x11vnc', x11vncArgs(view), {
+    cwd: CFG.runtimeDir,
     stdio: ['ignore', fs.openSync(logFile, 'a'), fs.openSync(logFile, 'a')],
+  });
+}
+
+function watchNovncProcess(s, kind, view) {
+  const child = view.novncProc;
+  let failed = false;
+  const markFailed = (reason) => {
+    if (failed || !sessions.has(s.token) || s[`${kind}Vnc`] !== view) return;
+    failed = true;
+    view.ready = false;
+    view.error = reason;
+    touch(s);
+    writeManifest(s.token);
+    log(`${kind} vnc failed token=${s.token.slice(0, 8)}: ${reason}`);
+  };
+  child.once('error', (error) => markFailed(`websockify failed to start: ${error.message}`));
+  child.once('exit', (code, signal) => {
+    const outcome = signal ? `signal ${signal}` : `code ${code ?? 'unknown'}`;
+    markFailed(`websockify exited with ${outcome}`);
   });
 }
 
@@ -239,13 +312,18 @@ function startVnc(s, kind, page) {
     `--web=${CFG.novncWeb}`,
     `0.0.0.0:${view.novncPort}`,
     `localhost:${view.vncPort}`,
-  ], { stdio: ['ignore', fs.openSync(novncLog, 'a'), fs.openSync(novncLog, 'a')] });
+  ], {
+    cwd: CFG.runtimeDir,
+    stdio: ['ignore', fs.openSync(novncLog, 'a'), fs.openSync(novncLog, 'a')],
+  });
   view.novncUrl = `http://${HOST}:${view.novncPort}/vnc.html?autoconnect=true&reconnect=true&reconnect_delay=1000&resize=scale&path=websockify`;
   s[`${kind}Vnc`] = view;
+  watchNovncProcess(s, kind, view);
   touch(s);
   void Promise.all([waitForTcp(view.vncPort), waitForTcp(view.novncPort)])
     .then(() => {
       if (!sessions.has(s.token) || s[`${kind}Vnc`] !== view) return;
+      if (view.error || view.novncProc.exitCode !== null || view.novncProc.signalCode) return;
       view.ready = true;
       touch(s);
       writeManifest(s.token);
@@ -530,7 +608,7 @@ function manifestFor(token) {
       lastActiveAt: page.lastActiveAt,
     }));
   return {
-    token,
+    token: s.accessToken,
     botmuxSessionId: s.botmuxSessionId,
     DISPLAY: CFG.display,
     geometry: `${process.env.ACS_LOGICAL_W || 1728}x${process.env.ACS_LOGICAL_H || 1117}@${process.env.ACS_DPR || 2}x`,
@@ -561,6 +639,7 @@ function writeManifest(token) {
 function teardown(token) {
   const s = sessions.get(token);
   if (!s) return;
+  if (s.teardownTimer) clearTimeout(s.teardownTimer);
   disposeVnc(s, 'follow');
   disposeVnc(s, 'free');
   // 关掉该 token 的所有窗口/target
@@ -571,7 +650,21 @@ function teardown(token) {
   }
   try { fs.unlinkSync(path.join(CFG.manifests, token + '.json')); } catch {}
   sessions.delete(token);
+  for (const [transportToken, sessionKey] of transportBindings) {
+    if (sessionKey === token) transportBindings.delete(transportToken);
+  }
   log('teardown token=' + token.slice(0, 8));
+}
+
+function scheduleTeardown(token) {
+  const s = sessions.get(token);
+  if (!s || s.connCount > 0 || s.teardownTimer) return;
+  s.teardownTimer = setTimeout(() => {
+    s.teardownTimer = null;
+    if (s.connCount <= 0) teardown(token);
+  }, CFG.reconnectGraceMs);
+  s.teardownTimer.unref();
+  log(`teardown scheduled token=${token.slice(0, 8)} grace=${CFG.reconnectGraceMs}ms`);
 }
 
 // ---- 每条 agent 连接的 CDP 过滤代理 ----
@@ -579,6 +672,10 @@ function attachProxy(agentWs, token) {
   // 连接引用计数：同一 token 可有多条连接（holder + 偶发探测）；
   // 只有最后一条连接关闭才 teardown —— 避免一个瞬时连接拆掉整个会话。
   const sessionState = getSession(token);
+  if (sessionState.teardownTimer) {
+    clearTimeout(sessionState.teardownTimer);
+    sessionState.teardownTimer = null;
+  }
   sessionState.connCount++;
   const up = new WebSocket(chromeBrowserWsUrl, { perMessageDeflate: false, maxPayload: 512 * 1024 * 1024 });
   const ownedTargets = new Set();
@@ -768,7 +865,10 @@ function attachProxy(agentWs, token) {
   agentWs.on('close', () => {
     cleanup();
     const s = sessions.get(token);
-    if (s) { s.connCount--; if (s.connCount <= 0) teardown(token); }  // 仅最后一条连接关闭才拆台
+    if (s) {
+      s.connCount = Math.max(0, s.connCount - 1);
+      if (s.connCount <= 0) scheduleTeardown(token);
+    }
   });
   agentWs.on('error', cleanup);
   up.on('close', () => { try { agentWs.close(); } catch {} });
@@ -823,39 +923,57 @@ const server = http.createServer(async (req, res) => {
     });
     return;
   }
+  // MCP wrapper binds its ephemeral transport token to a stable Botmux session id
+  // before forwarding the first session-entry tool.
+  m = u.pathname.match(/^\/s\/([^/]+)\/bind$/);
+  if (m && req.method === 'PUT') {
+    let body;
+    try { body = await readJsonBody(req); } catch { jsonResponse(res, 400, { error: 'bad_json' }); return; }
+    try {
+      const sessionKey = bindTransport(m[1], body?.sessionId);
+      jsonResponse(res, 200, { ok: true, sessionId: sessionKey });
+    } catch (error) {
+      jsonResponse(res, 400, { error: error.message });
+    }
+    return;
+  }
   // 旁路：manifest
   m = u.pathname.match(/^\/s\/([^/]+)\/manifest$/);
   if (m) {
-    const mf = manifestFor(m[1]);
+    const sessionKey = resolveSessionKey(m[1]);
+    const mf = sessionKey ? manifestFor(sessionKey) : null;
     jsonResponse(res, mf ? 200 : 404, mf || { error: 'no such session' });
     return;
   }
   // 旁路：切换只读/可写  /s/<token>/viewonly?mode=follow|free&on=0|1
   m = u.pathname.match(/^\/s\/([^/]+)\/viewonly$/);
   if (m) {
+    const sessionKey = resolveSessionKey(m[1]);
     const on = u.query.on !== '0';
     const mode = u.query.mode === 'free' ? 'free' : 'follow';
-    const ok = setViewonly(m[1], on, mode);
-    const s = sessions.get(m[1]);
+    const ok = setViewonly(sessionKey, on, mode);
+    const s = sessions.get(sessionKey);
     const ready = ok && await waitForViewReady(s, mode);
     jsonResponse(res, ready ? 200 : (ok ? 503 : 404), { ok: ready, mode, viewonly: on });
     return;
   }
   m = u.pathname.match(/^\/s\/([^/]+)\/view-mode$/);
   if (m && req.method === 'PUT') {
+    const sessionKey = resolveSessionKey(m[1]);
     let body;
     try { body = await readJsonBody(req); } catch { jsonResponse(res, 400, { error: 'bad_json' }); return; }
-    const manifest = setViewMode(m[1], body?.mode);
-    const s = sessions.get(m[1]);
+    const manifest = setViewMode(sessionKey, body?.mode);
+    const s = sessions.get(sessionKey);
     const ready = manifest && (body?.mode !== 'free' || await waitForViewReady(s, 'free'));
-    jsonResponse(res, ready ? 200 : (manifest ? 503 : 400), ready ? manifestFor(m[1]) : { error: manifest ? 'view_not_ready' : 'invalid_session_or_mode' });
+    jsonResponse(res, ready ? 200 : (manifest ? 503 : 400), ready ? manifestFor(sessionKey) : { error: manifest ? 'view_not_ready' : 'invalid_session_or_mode' });
     return;
   }
   m = u.pathname.match(/^\/s\/([^/]+)\/free-target$/);
   if (m && req.method === 'PUT') {
+    const sessionKey = resolveSessionKey(m[1]);
     let body;
     try { body = await readJsonBody(req); } catch { jsonResponse(res, 400, { error: 'bad_json' }); return; }
-    const s = sessions.get(m[1]);
+    const s = sessions.get(sessionKey);
     if (!s) { jsonResponse(res, 404, { error: 'no_such_session' }); return; }
     if (typeof body?.targetId !== 'string' || !selectFreeTarget(s, body.targetId)) {
       jsonResponse(res, 400, { error: 'invalid_or_unready_target' });
@@ -903,11 +1021,27 @@ server.on('upgrade', (req, socket, head) => {
   const parsed = url.parse(req.url, true);
   const m = parsed.pathname.match(/^\/s\/([^/]+)\/devtools\//);
   if (!m) { socket.destroy(); return; }
-  const token = m[1];
+  const transportToken = m[1];
   const botmuxSessionId = typeof parsed.query.botmuxSessionId === 'string' ? parsed.query.botmuxSessionId : undefined;
+  let token;
+  try {
+    if (botmuxSessionId) {
+      bindTransport(transportToken, botmuxSessionId);
+      token = resolveSessionKey(transportToken);
+    } else {
+      token = resolveWebSocketSessionKey(transportToken);
+    }
+    if (!token) throw new Error('invalid_access_token');
+  } catch {
+    socket.destroy();
+    return;
+  }
   wss.handleUpgrade(req, socket, head, (ws) => {
     log('agent connected token=' + token.slice(0, 8));
-    getSession(token, { botmuxSessionId });
+    getSession(token, {
+      accessToken: transportToken,
+      botmuxSessionId: botmuxSessionId || (token !== transportToken ? token : undefined),
+    });
     attachProxy(ws, token);
   });
 });

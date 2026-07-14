@@ -120,7 +120,7 @@ only `dist/`.
 ACS provides:
 
 - Single shared Chrome profile for live login reuse.
-- Per-session broker tokens and target filtering.
+- Stable Botmux session binding and per-session target filtering.
 - Per-session kiosk windows and noVNC views.
 - MCP connection through `bin/mcp-launch.sh`.
 - Structured native browser-session tools through the Agent Chrome MCP.
@@ -142,16 +142,23 @@ curl http://127.0.0.1:9300/health
 curl http://127.0.0.1:9300/sessions
 ```
 
-The Agent Chrome MCP adds these session-scoped tools alongside the standard
-Chrome DevTools tools:
+The Agent Chrome MCP adds two session-scoped tools alongside the standard Chrome
+DevTools tools:
 
 - `browser_session_info`
-- `browser_session_get_vnc_url`
 - `browser_session_set_writable`
-- `browser_session_screenshot`
-- `browser_session_activate`
-- `browser_session_send_keys`
-- `browser_session_click`
+
+Four entry tools require the exact current Botmux `<session_id>` in a
+`sessionId` argument: `list_pages`, `new_page`, `browser_session_info`, and
+`browser_session_set_writable`. The wrapper consumes that argument, binds its
+short-lived MCP transport to the stable Botmux session, and does not forward the
+extra argument to the upstream Chrome DevTools MCP. All other Chrome tools reuse
+the established binding. The stable session id is identity only; broker access
+continues to use a separate random transport token.
+
+If the CLI/MCP process reconnects, a new transport can rebind to the same
+`sessionId` during the broker grace period, preserving its pages and noVNC view.
+`browser_session_info` includes both follow and free-view noVNC URLs.
 
 `bin/browser-session` remains available for operator diagnostics only and
 requires an explicit `ACS_SESSION_TOKEN`. Agents should use the MCP tools.

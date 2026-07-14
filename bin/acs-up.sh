@@ -4,6 +4,7 @@
 # 幂等：各步自带"已在则复用"。
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
+cd "$ACS_RUN"
 
 bash "$ACS_BIN/start-display.sh"
 bash "$ACS_BIN/start-chrome.sh"
@@ -28,6 +29,8 @@ else
     if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null || true; fi
   done
   echo "[broker] starting on :${ACS_BROKER_PORT}"
+  # The distributable directory is replaced on update. All long-lived processes
+  # inherit ACS_RUN as their stable working directory.
   nohup node "$ACS_BIN/broker.js" >"$ACS_LOGS/broker.log" 2>&1 &
   for i in $(seq 1 50); do
     curl -fsS "http://127.0.0.1:${ACS_BROKER_PORT}/sessions" >/dev/null 2>&1 && break; sleep 0.1

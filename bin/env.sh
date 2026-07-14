@@ -5,13 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_ACS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ACS_ROOT="${ACS_ROOT:-$DEFAULT_ACS_ROOT}"
-if [ -n "${BOTMUX_PLUGIN_HOME:-}" ]; then
-  DEFAULT_ACS_DATA_ROOT="$BOTMUX_PLUGIN_HOME"
-elif [ "$(basename "$ACS_ROOT")" = "dist" ]; then
-  DEFAULT_ACS_DATA_ROOT="$(dirname "$ACS_ROOT")"
-else
-  DEFAULT_ACS_DATA_ROOT="$ACS_ROOT"
-fi
+DEFAULT_ACS_DATA_ROOT="${AGENT_CHROME_HOME:-${HOME:?HOME is required}/.agent-chrome}"
 ACS_DATA_ROOT="${ACS_DATA_ROOT:-$DEFAULT_ACS_DATA_ROOT}"
 ACS_DISPLAY="${ACS_DISPLAY:-:77}"
 ACS_SCREEN_W="${ACS_SCREEN_W:-3456}"

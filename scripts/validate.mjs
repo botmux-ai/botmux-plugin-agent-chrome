@@ -73,15 +73,30 @@ const mcpServer = readFileSync('dist/mcp/server.js', 'utf-8');
 if (!mcpServer.includes('"vendor"') || !mcpServer.includes('"chrome-devtools-mcp"')) {
   fail('composite MCP server must proxy the bundled Chrome DevTools MCP');
 }
-for (const tool of [
-  'browser_session_info',
-  'browser_session_get_vnc_url',
-  'browser_session_set_writable',
-  'browser_session_screenshot',
-  'browser_session_activate',
-]) {
+for (const tool of ['browser_session_info', 'browser_session_set_writable']) {
   if (!mcpServer.includes(tool)) fail(`composite MCP server is missing ${tool}`);
 }
+for (const removedTool of [
+  'browser_session_get_vnc_url',
+  'browser_session_screenshot',
+  'browser_session_activate',
+  'browser_session_send_keys',
+  'browser_session_click',
+]) {
+  if (mcpServer.includes(removedTool)) fail(`composite MCP server still exposes removed tool ${removedTool}`);
+}
+for (const marker of ['list_pages', 'new_page', 'sessionId', '/bind', 'No active Agent Chrome page']) {
+  if (!mcpServer.includes(marker)) fail(`composite MCP server is missing session binding marker: ${marker}`);
+}
+
+const broker = readFileSync('dist/bin/broker.js', 'utf-8');
+for (const marker of ['.agent-chrome', 'runtimeDir', 'process.chdir', 'websockify exited with', 'transportBindings', 'reconnectGraceMs']) {
+  if (!broker.includes(marker)) fail(`broker is missing runtime lifecycle marker: ${marker}`);
+}
+const runtimeEnv = readFileSync('dist/bin/env.sh', 'utf-8');
+if (!runtimeEnv.includes('/.agent-chrome')) fail('runtime data must default to ~/.agent-chrome');
+const stackLauncher = readFileSync('dist/bin/acs-up.sh', 'utf-8');
+if (!stackLauncher.includes('cd "$ACS_RUN"')) fail('broker must start from ACS_RUN');
 
 const commandIndex = readJson('dist/cli/commands.json');
 if (!commandIndex.commands?.some(command => command.name === 'agent-chrome:status')) fail('missing CLI command');
@@ -99,7 +114,10 @@ try {
   if (typeof handlers?.['agent-chrome:status']?.run !== 'function') fail('clean dist CLI bundle is not loadable');
   const service = cleanRequire(join(cleanRoot, 'service', 'index.js'));
   if (service?.mode !== 'auto') fail('clean dist service should use auto mode');
-  if (service?.pm2?.script !== './service/runner.js') fail('clean dist service bundle is not loadable');
+  if (service?.pm2?.script !== join(cleanRoot, 'service', 'runner.js')) fail('clean dist service bundle is not loadable');
+  if (service?.pm2?.cwd !== join(service?.pm2?.env?.ACS_DATA_ROOT ?? '', 'run') || service.pm2.cwd.startsWith(cleanRoot)) {
+    fail('service cwd must use the persistent Agent Chrome runtime directory');
+  }
 
   const vendoredMcp = spawnSync(process.execPath, [
     join(cleanRoot, 'vendor', 'chrome-devtools-mcp', 'src', 'bin', 'chrome-devtools-mcp.js'),
