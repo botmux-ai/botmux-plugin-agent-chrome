@@ -93,6 +93,9 @@ const broker = readFileSync('dist/bin/broker.js', 'utf-8');
 for (const marker of ['.agent-chrome', 'websockify exited with', 'transportBindings', 'reconnectGraceMs']) {
   if (!broker.includes(marker)) fail(`broker is missing runtime lifecycle marker: ${marker}`);
 }
+if (!broker.includes('-nocursorshape')) {
+  fail('x11vnc must render the cursor into the framebuffer so noVNC scales it with the display');
+}
 if (broker.includes('process.chdir(') || broker.includes('cwd: CFG.runtimeDir')) {
   fail('broker and VNC subprocesses must keep the plugin runtime working directory');
 }

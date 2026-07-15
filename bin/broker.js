@@ -224,7 +224,7 @@ function allocatePorts() {
 
 function x11vncArgs(view) {
   const args = ['-id', String(view.winId), '-display', CFG.display, '-rfbport', String(view.vncPort),
-    '-localhost', '-forever', '-shared', '-nopw', '-noxdamage', '-quiet'];
+    '-localhost', '-forever', '-shared', '-nopw', '-noxdamage', '-nocursorshape', '-quiet'];
   if (view.viewonly) args.push('-viewonly');
   return args;
 }
