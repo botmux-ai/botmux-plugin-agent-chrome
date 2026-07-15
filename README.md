@@ -13,8 +13,11 @@ this repository and generated under the installed plugin directory.
 ## Requirements
 
 - Linux with Node.js 20+, npm, Botmux, and Chrome or Chromium.
-- Xvfb, openbox, xcompmgr, wmctrl, x11vnc, websockify/noVNC, xdotool,
+- Xvfb, openbox, xcompmgr, wmctrl, x11vnc, websockify, xdotool,
   ImageMagick, and curl.
+
+The noVNC browser client is bundled into the plugin so its low-latency cursor
+can be scaled with the embedded Dashboard viewport.
 
 `chrome-devtools-mcp@1.5.0` is a pinned build input vendored into the plugin's
 self-contained `dist/`. MCP startup uses that bundled runtime and does not keep
@@ -26,7 +29,7 @@ On Debian or Ubuntu, install the system tools with:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y xvfb openbox xcompmgr wmctrl x11vnc websockify novnc \
+sudo apt-get install -y xvfb openbox xcompmgr wmctrl x11vnc websockify \
   xdotool imagemagick curl
 ```
 
@@ -199,5 +202,5 @@ The original ACS test scripts are preserved under `test/`:
 - `check-3session.js`
 - `check-mcp-e2e.js`
 
-These tests require Chrome, Xvfb, xdotool, x11vnc, websockify/noVNC, and the
+These tests require Chrome, Xvfb, xdotool, x11vnc, websockify, and the
 local machine runtime environment.

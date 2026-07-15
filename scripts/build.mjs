@@ -16,6 +16,7 @@ import { build } from 'esbuild';
 const require = createRequire(import.meta.url);
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const outputRoot = join(repoRoot, 'dist');
+const novncRoot = dirname(dirname(require.resolve('@novnc/novnc')));
 
 function assertNoSymlinks(path) {
   if (!existsSync(path)) return;
@@ -70,6 +71,9 @@ async function bundleBrowser(source, target) {
     format: 'esm',
     target: 'es2022',
     packages: 'bundle',
+    alias: {
+      '@botmux/novnc-cursor': join(novncRoot, 'core', 'util', 'cursor.js'),
+    },
     logLevel: 'silent',
   });
 }
@@ -131,10 +135,13 @@ await Promise.all([
   bundleNode(join(repoRoot, 'bin', 'broker.js'), join(outputRoot, 'bin', 'broker.js')),
   bundleNode(join(repoRoot, 'bin', 'open-session.js'), join(outputRoot, 'bin', 'open-session.js')),
   bundleBrowser(join(repoRoot, 'dashboard', 'index.js'), join(outputRoot, 'dashboard', 'index.js')),
+  bundleBrowser(join(repoRoot, 'novnc', 'viewer.js'), join(outputRoot, 'novnc', 'viewer.js')),
 ]);
 
 copyShellRuntime();
 copyTree(join(repoRoot, 'skills'), join(outputRoot, 'skills'));
+copyFile(join(repoRoot, 'novnc', 'vnc.html'), join(outputRoot, 'novnc', 'vnc.html'));
+copyFile(join(novncRoot, 'LICENSE.txt'), join(outputRoot, 'novnc', 'LICENSE.txt'));
 vendorChromeDevtoolsMcp();
 await generateCliIndex();
 await generateMcpIndex();

@@ -33,6 +33,7 @@ if (pkg.publishConfig?.registry !== 'https://registry.npmjs.org/' || pkg.publish
 }
 if (Object.keys(pkg.dependencies ?? {}).length !== 0) fail('runtime dependencies must be bundled into dist/');
 if (pkg.devDependencies?.['chrome-devtools-mcp'] !== '1.5.0') fail('chrome-devtools-mcp build input must stay pinned');
+if (pkg.devDependencies?.['@novnc/novnc'] !== '1.7.0') fail('noVNC build input must stay pinned');
 if (!pkg.devDependencies?.esbuild) fail('esbuild is required to bundle the plugin runtime');
 if (!pkg.devDependencies?.react) fail('React is required to build the plugin dashboard component');
 
@@ -47,6 +48,9 @@ for (const required of [
   'dist/dashboard/index.js',
   'dist/mcp/index.json',
   'dist/mcp/server.js',
+  'dist/novnc/LICENSE.txt',
+  'dist/novnc/viewer.js',
+  'dist/novnc/vnc.html',
   'dist/service/index.js',
   'dist/service/runner.js',
   'dist/skills/agent-chrome/SKILL.md',
@@ -93,14 +97,15 @@ const broker = readFileSync('dist/bin/broker.js', 'utf-8');
 for (const marker of ['.agent-chrome', 'websockify exited with', 'transportBindings', 'reconnectGraceMs']) {
   if (!broker.includes(marker)) fail(`broker is missing runtime lifecycle marker: ${marker}`);
 }
-if (!broker.includes('-nocursorshape')) {
-  fail('x11vnc must render the cursor into the framebuffer so noVNC scales it with the display');
+if (broker.includes('-nocursorshape')) {
+  fail('x11vnc must send CursorShape updates so the browser can render a low-latency cursor');
 }
 if (broker.includes('process.chdir(') || broker.includes('cwd: CFG.runtimeDir')) {
   fail('broker and VNC subprocesses must keep the plugin runtime working directory');
 }
 const runtimeEnv = readFileSync('dist/bin/env.sh', 'utf-8');
 if (!runtimeEnv.includes('/.agent-chrome')) fail('runtime data must default to ~/.agent-chrome');
+if (!runtimeEnv.includes('$ACS_ROOT/novnc')) fail('runtime must serve the bundled noVNC viewer');
 const stackLauncher = readFileSync('dist/bin/acs-up.sh', 'utf-8');
 if (stackLauncher.includes('cd "$ACS_RUN"')) fail('stack launcher must not migrate process cwd into the data directory');
 
@@ -110,6 +115,10 @@ if (!commandIndex.commands?.some(command => command.name === 'agent-chrome:statu
 const dashboard = readFileSync('dist/dashboard/index.js', 'utf-8');
 for (const marker of ['ac-session-list', 'view-mode', '/api/sessions', 'free-target', 'novncUrl']) {
   if (!dashboard.includes(marker)) fail(`dashboard is missing ${marker}`);
+}
+const viewer = readFileSync('dist/novnc/viewer.js', 'utf-8');
+for (const marker of ['scaleViewport', 'ResizeObserver', 'cursorDisplayScale', 'websockify']) {
+  if (!viewer.includes(marker)) fail(`bundled noVNC viewer is missing ${marker}`);
 }
 
 const cleanRoot = mkdtempSync(join(tmpdir(), 'agent-chrome-dist-'));

@@ -9,10 +9,11 @@
   "scripts": {
     "build": "node ./scripts/build.mjs",
     "validate": "node ./scripts/validate.mjs",
-    "test": "npm run build && npm run validate && node ./test/check-runtime-home.js && node ./test/check-launcher-runtime.js && node ./test/check-session-context.js && node ./test/check-broker-binding.js && node ./test/check-dashboard-copy.js",
+    "test": "npm run build && npm run validate && node ./test/check-cursor-scale.mjs && node ./test/check-runtime-home.js && node ./test/check-launcher-runtime.js && node ./test/check-session-context.js && node ./test/check-broker-binding.js && node ./test/check-dashboard-copy.js",
     "prepublishOnly": "npm test"
   },
   "devDependencies": {
+    "@novnc/novnc": "1.7.0",
     "chrome-devtools-mcp": "1.5.0",
     "esbuild": "^0.28.0",
     "puppeteer-core": "^25.2.1",
