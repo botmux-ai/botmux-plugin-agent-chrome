@@ -84,6 +84,35 @@ async function fetchJson(url, options) {
   }
 }
 
+export async function copyText(value) {
+  const clipboard = globalThis.navigator?.clipboard;
+  if (typeof clipboard?.writeText === 'function') {
+    await clipboard.writeText(value);
+    return;
+  }
+
+  const document = globalThis.document;
+  if (!document?.body || typeof document.createElement !== 'function' || typeof document.execCommand !== 'function') {
+    throw new Error('当前浏览器不支持自动复制');
+  }
+
+  const textarea = document.createElement('textarea');
+  textarea.value = value;
+  textarea.setAttribute('readonly', '');
+  textarea.style.position = 'fixed';
+  textarea.style.left = '-9999px';
+  textarea.style.opacity = '0';
+  document.body.appendChild(textarea);
+  try {
+    textarea.focus?.();
+    textarea.select();
+    textarea.setSelectionRange?.(0, value.length);
+    if (!document.execCommand('copy')) throw new Error('复制失败，请手动打开链接');
+  } finally {
+    textarea.remove();
+  }
+}
+
 export default class AgentChromeDashboard extends React.Component {
   constructor(props) {
     super(props);
@@ -207,7 +236,7 @@ export default class AgentChromeDashboard extends React.Component {
   async copyUrl(url) {
     if (!url) return;
     try {
-      await navigator.clipboard.writeText(url);
+      await copyText(url);
       this.setState({ copied: true });
       clearTimeout(this.copyTimer);
       this.copyTimer = setTimeout(() => this.setState({ copied: false }), 1600);

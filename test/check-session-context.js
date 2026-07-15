@@ -16,6 +16,7 @@ writeFileSync(fakeMcp, `
 'use strict';
 const readline = require('node:readline');
 const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+const wsEndpointArg = process.argv.find(value => value.startsWith('--wsEndpoint=')) || '';
 function send(message) { process.stdout.write(JSON.stringify(message) + '\\n'); }
 input.on('line', line => {
   const request = JSON.parse(line);
@@ -50,7 +51,7 @@ input.on('line', line => {
       jsonrpc: '2.0',
       id: request.id,
       result: {
-        content: [{ type: 'text', text: JSON.stringify({ name: request.params.name, arguments: request.params.arguments || {} }) }],
+        content: [{ type: 'text', text: JSON.stringify({ name: request.params.name, arguments: request.params.arguments || {}, wsEndpointArg }) }],
       },
     });
   }
@@ -206,6 +207,8 @@ async function exerciseClient(port, transportToken) {
     });
     assert(bindings.get(transportToken) === stableSessionId, 'transport was not bound to the stable session');
     assert(Object.keys(forwarded(listPages).arguments).length === 0, 'sessionId must not be forwarded downstream');
+    const endpoint = new URL(forwarded(listPages).wsEndpointArg.replace(/^--wsEndpoint=/, ''));
+    assert(endpoint.searchParams.get('botmuxSessionId') === stableSessionId, 'trusted Botmux session must be attached to the initial broker WebSocket');
 
     const click = await client.rpc('tools/call', { name: 'click', arguments: { uid: 'node-1' } });
     assert(forwarded(click).arguments.uid === 'node-1', 'bound non-entry tool must pass through unchanged');

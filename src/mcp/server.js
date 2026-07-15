@@ -12,7 +12,8 @@ const trustedSessionId = process.env.BOTMUX_SESSION_ID?.trim() || null;
 const brokerSessionUrl = `http://127.0.0.1:${brokerPort}/s/${encodeURIComponent(transportToken)}`;
 const mcpEntry = process.env.ACS_MCP_BIN
   || join(pluginRoot, 'vendor', 'chrome-devtools-mcp', 'src', 'bin', 'chrome-devtools-mcp.js');
-const wsEndpoint = `ws://127.0.0.1:${brokerPort}/s/${transportToken}/devtools/browser/${randomUUID().replaceAll('-', '')}`;
+const wsEndpoint = `ws://127.0.0.1:${brokerPort}/s/${transportToken}/devtools/browser/${randomUUID().replaceAll('-', '')}`
+  + (trustedSessionId ? `?botmuxSessionId=${encodeURIComponent(trustedSessionId)}` : '');
 
 const SESSION_ENTRY_TOOL_NAMES = new Set([
   'list_pages',
