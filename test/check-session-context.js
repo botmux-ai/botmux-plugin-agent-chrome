@@ -16,7 +16,6 @@ writeFileSync(fakeMcp, `
 'use strict';
 const readline = require('node:readline');
 const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
-const wsEndpointArg = process.argv.find(value => value.startsWith('--wsEndpoint=')) || '';
 function send(message) { process.stdout.write(JSON.stringify(message) + '\\n'); }
 input.on('line', line => {
   const request = JSON.parse(line);
@@ -51,7 +50,7 @@ input.on('line', line => {
       jsonrpc: '2.0',
       id: request.id,
       result: {
-        content: [{ type: 'text', text: JSON.stringify({ name: request.params.name, arguments: request.params.arguments || {}, wsEndpointArg }) }],
+        content: [{ type: 'text', text: JSON.stringify({ name: request.params.name, arguments: request.params.arguments || {} }) }],
       },
     });
   }
@@ -188,37 +187,40 @@ async function exerciseClient(port, transportToken) {
     ]) {
       assert(!tools.has(name), `${name} should not be exposed`);
     }
+    assert(!bindings.has(transportToken), 'initialize and tools/list must not bind the transport');
 
     const directClick = await client.rpc('tools/call', { name: 'click', arguments: { uid: 'node-1' } });
     assert(directClick.result?.isError === true && /list_pages or new_page/.test(resultText(directClick)), 'unbound non-entry tool must fail safely');
+    assert(!bindings.has(transportToken), 'rejected non-entry tool must not bind the transport');
 
     const missingSession = await client.rpc('tools/call', { name: 'list_pages', arguments: {} });
     assert(missingSession.result?.isError === true, 'entry tool must reject a missing sessionId');
+    assert(!bindings.has(transportToken), 'entry tool without sessionId must not bind the transport');
 
     const wrongSession = await client.rpc('tools/call', {
       name: 'list_pages',
       arguments: { sessionId: 'another-session' },
     });
     assert(wrongSession.result?.isError === true && /does not match/.test(resultText(wrongSession)), 'trusted Botmux session mismatch must be rejected');
-
-    const listPages = await client.rpc('tools/call', {
-      name: 'list_pages',
-      arguments: { sessionId: stableSessionId },
-    });
-    assert(bindings.get(transportToken) === stableSessionId, 'transport was not bound to the stable session');
-    assert(Object.keys(forwarded(listPages).arguments).length === 0, 'sessionId must not be forwarded downstream');
-    const endpoint = new URL(forwarded(listPages).wsEndpointArg.replace(/^--wsEndpoint=/, ''));
-    assert(endpoint.searchParams.get('botmuxSessionId') === stableSessionId, 'trusted Botmux session must be attached to the initial broker WebSocket');
-
-    const click = await client.rpc('tools/call', { name: 'click', arguments: { uid: 'node-1' } });
-    assert(forwarded(click).arguments.uid === 'node-1', 'bound non-entry tool must pass through unchanged');
+    assert(!bindings.has(transportToken), 'mismatched sessionId must not bind the transport');
 
     const newPage = await client.rpc('tools/call', {
       name: 'new_page',
       arguments: { sessionId: stableSessionId, url: 'about:blank' },
     });
+    assert(bindings.get(transportToken) === stableSessionId, 'first valid entry tool must bind the transport');
     assert(forwarded(newPage).arguments.url === 'about:blank', 'new_page must preserve upstream arguments');
     assert(forwarded(newPage).arguments.sessionId === undefined, 'new_page must strip sessionId before forwarding');
+
+    const listPages = await client.rpc('tools/call', {
+      name: 'list_pages',
+      arguments: { sessionId: stableSessionId },
+    });
+    assert(bindings.get(transportToken) === stableSessionId, 'subsequent entry tool must reuse the stable session binding');
+    assert(Object.keys(forwarded(listPages).arguments).length === 0, 'sessionId must not be forwarded downstream');
+
+    const click = await client.rpc('tools/call', { name: 'click', arguments: { uid: 'node-1' } });
+    assert(forwarded(click).arguments.uid === 'node-1', 'bound non-entry tool must pass through unchanged');
 
     const info = await client.rpc('tools/call', {
       name: 'browser_session_info',

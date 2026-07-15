@@ -167,11 +167,6 @@ extra argument to the upstream Chrome DevTools MCP. All other Chrome tools reuse
 the established binding. The stable session id is identity only; broker access
 continues to use a separate random transport token.
 
-When Botmux Gateway supplies `BOTMUX_SESSION_ID`, the wrapper also attaches that
-trusted id to its initial broker WebSocket. Dashboard metadata is therefore
-linked before the model's first tool call; explicit entry-tool arguments remain
-validated against the same id.
-
 If the CLI/MCP process reconnects, a new transport can rebind to the same
 `sessionId` during the broker grace period, preserving its pages and noVNC view.
 `browser_session_info` includes both follow and free-view noVNC URLs.
