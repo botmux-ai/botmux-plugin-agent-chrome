@@ -111,7 +111,7 @@ const stackLauncher = readFileSync('dist/bin/acs-up.sh', 'utf-8');
 if (stackLauncher.includes('cd "$ACS_RUN"')) fail('stack launcher must not migrate process cwd into the data directory');
 if (!stackLauncher.includes('--prepare-only')) fail('stack launcher must let the service runner prepare Chrome without detaching the broker');
 const serviceRunner = readFileSync('dist/service/runner.js', 'utf-8');
-for (const marker of ['ACS_SERVICE_INSTANCE_ID', 'managed child ready', 'replacing existing listener', 'cleanPreviousBuilds']) {
+for (const marker of ['ACS_SERVICE_INSTANCE_ID', 'ACS_NOVNC_WEB', 'managed child ready', 'replacing existing listener', 'cleanPreviousBuilds']) {
   if (!serviceRunner.includes(marker)) fail(`service runner is missing broker ownership marker: ${marker}`);
 }
 

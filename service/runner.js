@@ -9,9 +9,11 @@ const net = require('net');
 const path = require('path');
 
 const root = path.resolve(__dirname, '..');
+const runtimeRoot = process.env.ACS_ROOT || root;
 const env = {
   ...process.env,
-  ACS_ROOT: process.env.ACS_ROOT || root,
+  ACS_ROOT: runtimeRoot,
+  ACS_NOVNC_WEB: process.env.ACS_NOVNC_WEB || path.join(runtimeRoot, 'novnc'),
 };
 const port = Number(env.ACS_BROKER_PORT || 9300);
 const serviceInstanceId = crypto.randomUUID();
