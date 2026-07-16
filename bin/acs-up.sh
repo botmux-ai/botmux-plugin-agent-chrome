@@ -5,8 +5,21 @@
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
 
+PREPARE_ONLY=0
+if [ "${1:-}" = "--prepare-only" ]; then
+  PREPARE_ONLY=1
+elif [ -n "${1:-}" ]; then
+  echo "unknown option: $1" >&2
+  exit 2
+fi
+
 bash "$ACS_BIN/start-display.sh"
 bash "$ACS_BIN/start-chrome.sh"
+
+if [ "$PREPARE_ONLY" = "1" ]; then
+  echo "=== ACS display and Chrome ready (broker managed by service runner) ==="
+  exit 0
+fi
 
 # broker：端口已健康则不重起
 if curl -fsS "http://127.0.0.1:${ACS_BROKER_PORT}/sessions" >/dev/null 2>&1; then

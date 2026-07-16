@@ -48,6 +48,7 @@ function hostHint() {
   catch { return '127.0.0.1'; }
 }
 const HOST = hostHint();
+const SERVICE_INSTANCE_ID = process.env.ACS_SERVICE_INSTANCE_ID || null;
 
 let chromeBrowserWsUrl = null;       // 真 Chrome 的 browser ws
 let control = null;                  // broker 自用控制连接（provisioning）
@@ -986,6 +987,7 @@ const server = http.createServer(async (req, res) => {
     jsonResponse(res, 200, {
       ok: true,
       pid: process.pid,
+      serviceInstanceId: SERVICE_INSTANCE_ID,
       sessions: sessions.size,
       chromeBrowserWsUrl: Boolean(chromeBrowserWsUrl),
     });

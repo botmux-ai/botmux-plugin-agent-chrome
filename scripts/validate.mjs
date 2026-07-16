@@ -54,6 +54,7 @@ for (const required of [
   'dist/service/index.js',
   'dist/service/runner.js',
   'dist/skills/agent-chrome/SKILL.md',
+  'dist/botmux-build/stamp',
   'dist/vendor/chrome-devtools-mcp/package.json',
   'dist/vendor/chrome-devtools-mcp/LICENSE',
   'dist/vendor/chrome-devtools-mcp/src/bin/chrome-devtools-mcp.js',
@@ -94,7 +95,7 @@ for (const marker of ['list_pages', 'new_page', 'sessionId', '/bind', 'No active
 }
 
 const broker = readFileSync('dist/bin/broker.js', 'utf-8');
-for (const marker of ['.agent-chrome', 'websockify exited with', 'transportBindings', 'reconnectGraceMs']) {
+for (const marker of ['.agent-chrome', 'websockify exited with', 'transportBindings', 'reconnectGraceMs', 'serviceInstanceId']) {
   if (!broker.includes(marker)) fail(`broker is missing runtime lifecycle marker: ${marker}`);
 }
 if (broker.includes('-nocursorshape')) {
@@ -108,6 +109,11 @@ if (!runtimeEnv.includes('/.agent-chrome')) fail('runtime data must default to ~
 if (!runtimeEnv.includes('$ACS_ROOT/novnc')) fail('runtime must serve the bundled noVNC viewer');
 const stackLauncher = readFileSync('dist/bin/acs-up.sh', 'utf-8');
 if (stackLauncher.includes('cd "$ACS_RUN"')) fail('stack launcher must not migrate process cwd into the data directory');
+if (!stackLauncher.includes('--prepare-only')) fail('stack launcher must let the service runner prepare Chrome without detaching the broker');
+const serviceRunner = readFileSync('dist/service/runner.js', 'utf-8');
+for (const marker of ['ACS_SERVICE_INSTANCE_ID', 'managed child ready', 'replacing existing listener', 'cleanPreviousBuilds']) {
+  if (!serviceRunner.includes(marker)) fail(`service runner is missing broker ownership marker: ${marker}`);
+}
 
 const commandIndex = readJson('dist/cli/commands.json');
 if (!commandIndex.commands?.some(command => command.name === 'agent-chrome:status')) fail('missing CLI command');
@@ -131,6 +137,8 @@ try {
   if (service?.mode !== 'auto') fail('clean dist service should use auto mode');
   if (service?.pm2?.script !== './service/runner.js') fail('clean dist service bundle is not loadable');
   if (service?.pm2?.cwd !== undefined) fail('service cwd must remain the plugin runtime directory managed by Botmux');
+  if (service?.pm2?.killTimeoutMs !== 10_000) fail('service must allow the managed broker to stop gracefully');
+  if (service?.pm2?.watchDelayMs !== 2_000) fail('linked development must wait for an atomic build before restart');
 
   const vendoredMcp = spawnSync(process.execPath, [
     join(cleanRoot, 'vendor', 'chrome-devtools-mcp', 'src', 'bin', 'chrome-devtools-mcp.js'),
