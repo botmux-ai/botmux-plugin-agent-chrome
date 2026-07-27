@@ -53,11 +53,82 @@ const SERVICE_INSTANCE_ID = process.env.ACS_SERVICE_INSTANCE_ID || null;
 let chromeBrowserWsUrl = null;       // 真 Chrome 的 browser ws
 let control = null;                  // broker 自用控制连接（provisioning）
 const targetOwner = new Map();       // targetId -> stable session key
+const tabOwner = new Map();          // tab targetId -> stable session key
+const cdpSessionOwner = new Map();   // flattened CDP sessionId -> stable session key
 const sessions = new Map();          // stable session key -> session state
 const transportBindings = new Map(); // MCP transport token -> stable session key
 const usedPortSlots = new Set();     // Follow / Free VNC 共用端口池
 const mappedWindows = new Set();     // 已分配的 X11 window-id（全局，供"新窗口差集"映射）
 let provChain = Promise.resolve();   // provisioning 串行化队列（避免并发映射歧义）
+
+// newWindow=true creates a `tab` target plus a nested `page` target. Puppeteer
+// auto-attaches to every new tab with waitForDebuggerOnStart=true, so ownership
+// must be decided before more than one client can create a window. The old
+// per-connection one-second heuristic let concurrent clients claim and pause
+// each other's tabs. An explicit global transaction makes the relationship
+// deterministic while keeping all work after page creation fully concurrent.
+const createQueue = [];
+let activeCreate = null;
+const CREATE_TAB_TIMEOUT_MS = Number(process.env.ACS_CREATE_TAB_TIMEOUT_MS || 2000);
+
+function startNextCreate() {
+  if (activeCreate) return;
+  while (createQueue.length) {
+    const job = createQueue.shift();
+    if (job.closed()) {
+      job.reject('Target.createTarget cancelled because the client disconnected');
+      continue;
+    }
+    activeCreate = {
+      ...job,
+      tabIds: new Set(),
+      responseSeen: false,
+      failed: false,
+      releaseTimer: null,
+    };
+    job.start();
+    return;
+  }
+}
+
+function enqueueCreate(job) {
+  createQueue.push(job);
+  startNextCreate();
+}
+
+function finishCreate() {
+  if (!activeCreate) return;
+  if (activeCreate.releaseTimer) clearTimeout(activeCreate.releaseTimer);
+  activeCreate = null;
+  startNextCreate();
+}
+
+function maybeFinishCreate() {
+  if (!activeCreate || !activeCreate.responseSeen) return;
+  if (activeCreate.failed || !activeCreate.expectsTab || activeCreate.tabIds.size > 0) {
+    finishCreate();
+    return;
+  }
+  if (!activeCreate.releaseTimer) {
+    activeCreate.releaseTimer = setTimeout(() => {
+      log(`create transaction timed out waiting for tab token=${activeCreate?.token.slice(0, 8) || '-'}`);
+      finishCreate();
+    }, CREATE_TAB_TIMEOUT_MS);
+    activeCreate.releaseTimer.unref();
+  }
+}
+
+function claimTransactionTab(targetId) {
+  if (!tabOwner.has(targetId) && activeCreate) {
+    tabOwner.set(targetId, activeCreate.token);
+  }
+  const owner = tabOwner.get(targetId);
+  if (activeCreate && owner === activeCreate.token) {
+    activeCreate.tabIds.add(targetId);
+    maybeFinishCreate();
+  }
+  return owner;
+}
 
 async function ensureChrome() {
   const v = await httpGetJson(`http://127.0.0.1:${CFG.chromePort}/json/version`);
@@ -644,6 +715,12 @@ function teardown(token) {
     targetOwner.delete(page.targetId);
     if (page.winId) mappedWindows.delete(page.winId);
   }
+  for (const [targetId, owner] of tabOwner) {
+    if (owner === token) tabOwner.delete(targetId);
+  }
+  for (const [sessionId, owner] of cdpSessionOwner) {
+    if (owner === token) cdpSessionOwner.delete(sessionId);
+  }
   try { fs.unlinkSync(path.join(CFG.manifests, token + '.json')); } catch {}
   sessions.delete(token);
   for (const [transportToken, sessionKey] of transportBindings) {
@@ -668,6 +745,7 @@ function attachProxy(agentWs, token) {
   // 连接引用计数：同一 token 可有多条连接（holder + 偶发探测）；
   // 只有最后一条连接关闭才 teardown —— 避免一个瞬时连接拆掉整个会话。
   const sessionState = getSession(token);
+  const proxyKey = Symbol(token);
   if (sessionState.teardownTimer) {
     clearTimeout(sessionState.teardownTimer);
     sessionState.teardownTimer = null;
@@ -675,12 +753,11 @@ function attachProxy(agentWs, token) {
   sessionState.connCount++;
   const up = new WebSocket(chromeBrowserWsUrl, { perMessageDeflate: false, maxPayload: 512 * 1024 * 1024 });
   const ownedTargets = new Set();
-  const myTabs = new Set();                  // 本 token 的 tab target（在 createTarget 窗口内出现）
+  const myTabs = new Set();
   const hiddenSessions = new Set();
-  const pendingCreate = new Set();          // 本连接 Target.createTarget 的命令 id
-  let lastCreateAt = 0;                       // 最近一次 createTarget 时刻（tab 归属判定的宽限窗口）
-  const midCreate = () => pendingCreate.size > 0 || (Date.now() - lastCreateAt < 1000);
+  const pendingCreate = new Map();           // command id -> explicit global create job
   const pendingGetTargets = new Set();      // 本连接 Target.getTargets 的命令 id（需过滤结果）
+  let autoAttachWaitsForDebugger = false;
   // 归属未定的 Target 事件先缓冲（解决 attachedToTarget 早于 createTarget 结果的竞态）：
   //   targetId -> { msgs:[], sessionIds:Set, timer }
   const pendingByTarget = new Map();
@@ -692,6 +769,7 @@ function attachProxy(agentWs, token) {
     } else if (method === 'Target.attachedToTarget') {
       const targetInfo = message.params?.targetInfo;
       if (targetInfo?.type === 'page' && message.params?.sessionId) {
+        cdpSessionOwner.set(message.params.sessionId, token);
         sessionState.cdpSessions.set(message.params.sessionId, targetInfo.targetId);
         recordTargetInfo(token, targetInfo);
       }
@@ -702,10 +780,10 @@ function attachProxy(agentWs, token) {
     clearTimeout(e.timer); pendingByTarget.delete(t);
     for (const msg of e.msgs) { recordOwnedEvent(msg); sendDown(msg); }
   }
-  function dropUnclaimed(t) {                 // 超时未认领 → 判定为别人的，隐藏其 session、丢弃事件
+  function dropUnclaimed(t) {                 // 超时未认领 → 判定为别人的，恢复并隐藏其 session
     const e = pendingByTarget.get(t); if (!e) return;
     pendingByTarget.delete(t);
-    for (const sid of e.sessionIds) hiddenSessions.add(sid);
+    for (const sid of e.sessionIds) hideSession(sid);
   }
   function bufferEvent(t, msg, sid) {
     let e = pendingByTarget.get(t);
@@ -717,8 +795,22 @@ function attachProxy(agentWs, token) {
   const sendDown = (obj) => { if (agentWs.readyState === WebSocket.OPEN) agentWs.send(JSON.stringify(obj)); };
   const sendUp = (obj) => { if (up.readyState === WebSocket.OPEN) up.send(JSON.stringify(obj)); };
   const queue = [];
+  const internalIds = new Set();
+  let nextInternalId = -1;
   up.on('open', () => { for (const m of queue) up.send(m); queue.length = 0; });
   const rawUp = (s) => { if (up.readyState === WebSocket.OPEN) up.send(s); else queue.push(s); };
+  const sendInternal = (method, params, sessionId) => {
+    const id = nextInternalId--;
+    internalIds.add(id);
+    rawUp(JSON.stringify({ id, method, params: params || {}, ...(sessionId ? { sessionId } : {}) }));
+  };
+  function hideSession(sessionId) {
+    if (!sessionId || hiddenSessions.has(sessionId)) return;
+    hiddenSessions.add(sessionId);
+    // A foreign auto-attach with waitForDebuggerOnStart=true must never remain
+    // paused merely because its event is hidden from this client.
+    sendInternal('Runtime.runIfWaitingForDebugger', {}, sessionId);
+  }
 
   const DBG = process.env.ACS_DEBUG === '1';
   // agent -> chrome
@@ -726,6 +818,10 @@ function attachProxy(agentWs, token) {
     let m; try { m = JSON.parse(raw.toString()); } catch { return; }
     const method = m.method || '';
     if (DBG) log('A→C', m.id || '', method, m.sessionId ? 'sid=' + m.sessionId.slice(0, 6) : '');
+    if (method === 'Target.setAutoAttach' && !m.sessionId) {
+      autoAttachWaitsForDebugger =
+        m.params?.autoAttach === true && m.params?.waitForDebuggerOnStart === true;
+    }
     if (method === 'Target.createTarget') {
       // 强制每个页落到独立窗口（MCP 默认建 tab，会与别的 session 挤在同一窗口，
       // 破坏 per-session 窗口/noVNC 隔离）。注入 newWindow + kiosk 尺寸。
@@ -733,7 +829,20 @@ function attachProxy(agentWs, token) {
       if (m.params.newWindow === undefined) m.params.newWindow = true;
       if (m.params.width === undefined) m.params.width = LOGICAL_W;
       if (m.params.height === undefined) m.params.height = LOGICAL_H;
-      pendingCreate.add(m.id); lastCreateAt = Date.now(); rawUp(JSON.stringify(m)); return;
+      const job = {
+        token,
+        proxyKey,
+        id: m.id,
+        expectsTab: autoAttachWaitsForDebugger,
+        closed: () => agentWs.readyState !== WebSocket.OPEN,
+        start: () => {
+          pendingCreate.set(m.id, job);
+          rawUp(JSON.stringify(m));
+        },
+        reject: (message) => sendDown({ id: m.id, error: { code: -32000, message } }),
+      };
+      enqueueCreate(job);
+      return;
     }
     if (method === 'Target.getTargets') { pendingGetTargets.add(m.id); rawUp(JSON.stringify(m)); return; }
     // 跨 owner 的危险操作：仅当目标"已知属于别的 token"时拒绝
@@ -745,7 +854,10 @@ function attachProxy(agentWs, token) {
       sendDown({ id: m.id, error: { code: -32000, message: `target ${tid} not owned by this session` } });
       return;
     }
-    if (m.sessionId && hiddenSessions.has(m.sessionId)) {
+    if (m.sessionId && (
+      hiddenSessions.has(m.sessionId) ||
+      (cdpSessionOwner.has(m.sessionId) && cdpSessionOwner.get(m.sessionId) !== token)
+    )) {
       sendDown({ id: m.id, error: { code: -32000, message: 'session not visible' } });
       return;
     }
@@ -764,8 +876,13 @@ function attachProxy(agentWs, token) {
       (m.params && m.params.targetInfo) ? `t=${m.params.targetInfo.targetId.slice(0,6)}[${m.params.targetInfo.type}]` : '',
       (m.params && m.params.targetId) ? 'tid=' + m.params.targetId.slice(0, 6) : '',
       (m.result && m.result.targetId) ? 'newtid=' + m.result.targetId.slice(0, 6) : '');
+    if (m.id !== undefined && internalIds.has(m.id)) {
+      internalIds.delete(m.id);
+      return;
+    }
     // 创建结果：认领归属并触发 provisioning
     if (m.id !== undefined && pendingCreate.has(m.id)) {
+      const job = pendingCreate.get(m.id);
       pendingCreate.delete(m.id);
       if (m.result && m.result.targetId) {
         const t = m.result.targetId;
@@ -775,6 +892,11 @@ function attachProxy(agentWs, token) {
         flushOwned(t);                       // 放行此前缓冲的 targetCreated/attachedToTarget
         markAgentActive(token, t);
         provision(token, t).catch((e) => log('prov err', e.message));
+      }
+      if (activeCreate?.proxyKey === job.proxyKey && activeCreate.id === job.id) {
+        activeCreate.responseSeen = true;
+        activeCreate.failed = !m.result?.targetId;
+        maybeFinishCreate();
       }
       sendDown(m);
       return;
@@ -792,15 +914,16 @@ function attachProxy(agentWs, token) {
     }
     const method = m.method || '';
     // 隔离核心：
-    //  - 'tab' 类型：只有"在我有未决 createTarget 时出现"的才是我的（myTabs），其余隐藏。
-    //    隐藏 tab → puppeteer 不会驱动它 → 其内嵌 page 的 attach 根本不会产生 → 别人的页天然不可见。
+    //  - 'tab' 类型：由全局 create transaction 显式认领，不再按时间窗口猜测。
+    //    外来 auto-attach session 在隐藏前必须 runIfWaitingForDebugger，不能把 owner 的页卡死。
     //  - 'page' 类型：按归属过滤（带竞态缓冲）。我的 page 只会出现在我的 tab 里。
     //  - 'browser' 等基础设施：透明放行。
     if (method === 'Target.targetCreated') {
       const ti = m.params.targetInfo; const t = ti.targetId;
       if (ti.type === 'tab') {
-        if (midCreate()) { myTabs.add(t); sendDown(m); }              // 我正在创建 → 是我的 tab
-        return;                                                       // 否则是别人的 tab → 隐藏
+        const owner = tabOwner.get(t) || claimTransactionTab(t);
+        if (owner === token) { myTabs.add(t); sendDown(m); }
+        return;
       }
       if (ti.type !== 'page') { sendDown(m); return; }
       if (ownedTargets.has(t) || targetOwner.get(t) === token) {
@@ -812,7 +935,13 @@ function attachProxy(agentWs, token) {
     }
     if (method === 'Target.targetInfoChanged') {
       const ti = m.params.targetInfo; const t = ti.targetId;
-      if (ti.type === 'tab') { if (myTabs.has(t)) sendDown(m); return; }
+      if (ti.type === 'tab') {
+        if ((tabOwner.get(t) || claimTransactionTab(t)) === token) {
+          myTabs.add(t);
+          sendDown(m);
+        }
+        return;
+      }
       if (ti.type !== 'page') { sendDown(m); return; }
       if (ownedTargets.has(t)) { recordTargetInfo(token, ti); sendDown(m); }
       else if (pendingByTarget.has(t)) bufferEvent(t, m);
@@ -821,29 +950,51 @@ function attachProxy(agentWs, token) {
     if (method === 'Target.attachedToTarget') {
       const ti = m.params.targetInfo; const t = ti.targetId; const sid = m.params.sessionId;
       if (ti.type === 'tab') {
-        if (myTabs.has(t)) sendDown(m); else hiddenSessions.add(sid); // 别人的 tab → 隐藏其 session
+        const owner = tabOwner.get(t) || claimTransactionTab(t);
+        if (owner) cdpSessionOwner.set(sid, owner);
+        if (owner === token) {
+          myTabs.add(t);
+          sendDown(m);
+        } else {
+          hideSession(sid);
+        }
         return;
       }
       if (ti.type !== 'page') { sendDown(m); return; }
       if (ownedTargets.has(t) || targetOwner.get(t) === token) {
         ownedTargets.add(t);
+        cdpSessionOwner.set(sid, token);
         sessionState.cdpSessions.set(sid, t);
         recordTargetInfo(token, ti);
         sendDown(m);
       }
-      else if (targetOwner.has(t)) { hiddenSessions.add(sid); }
+      else if (targetOwner.has(t)) {
+        cdpSessionOwner.set(sid, targetOwner.get(t));
+        hideSession(sid);
+      }
       else bufferEvent(t, m, sid);
       return;
     }
     if (method === 'Target.detachedFromTarget') {
       const sid = m.params.sessionId;
-      if (hiddenSessions.has(sid)) { hiddenSessions.delete(sid); return; }
+      if (hiddenSessions.has(sid)) {
+        hiddenSessions.delete(sid);
+        cdpSessionOwner.delete(sid);
+        return;
+      }
+      cdpSessionOwner.delete(sid);
       sessionState.cdpSessions.delete(sid);
       sendDown(m); return;
     }
     if (method === 'Target.targetDestroyed') {
       const t = m.params.targetId;
-      if (myTabs.has(t)) { myTabs.delete(t); sendDown(m); return; }
+      if (tabOwner.has(t)) {
+        const owner = tabOwner.get(t);
+        tabOwner.delete(t);
+        myTabs.delete(t);
+        if (owner === token) sendDown(m);
+        return;
+      }
       if (targetOwner.has(t) && targetOwner.get(t) !== token) return; // 别人的 page → 丢
       if (targetOwner.has(t) || ownedTargets.has(t)) {
         ownedTargets.delete(t);
@@ -860,6 +1011,10 @@ function attachProxy(agentWs, token) {
   const cleanup = () => { try { up.close(); } catch {}; };
   agentWs.on('close', () => {
     cleanup();
+    for (let i = createQueue.length - 1; i >= 0; i--) {
+      if (createQueue[i].proxyKey === proxyKey) createQueue.splice(i, 1);
+    }
+    if (activeCreate?.proxyKey === proxyKey) finishCreate();
     const s = sessions.get(token);
     if (s) {
       s.connCount = Math.max(0, s.connCount - 1);
