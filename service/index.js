@@ -9,6 +9,8 @@ module.exports = {
       ACS_BROKER_PORT: String(port),
     },
     autorestart: true,
+    killTimeoutMs: 10_000,
+    watchDelayMs: 2_000,
   },
   urls({ host }) {
     return {

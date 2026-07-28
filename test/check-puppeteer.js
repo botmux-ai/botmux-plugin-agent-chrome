@@ -4,13 +4,14 @@
 // 截图正常。这一步过了，说明未改动的 MCP 也能正常工作且被隔离。
 const puppeteer = require('puppeteer-core');
 
-const BROKER = 'http://127.0.0.1:9300';
+const BROKER_PORT = process.env.ACS_BROKER_PORT || 9300;
+const BROKER = `http://127.0.0.1:${BROKER_PORT}`;
 const TA = 'pptrA' + Date.now();
 const TB = 'pptrB' + Date.now();
 
 async function sess(token, color, text) {
   // 用 wsEndpoint：token 在 ws 路径里，puppeteer 直连不走 /json/version（路径不会被吞）
-  const wsEndpoint = `ws://127.0.0.1:9300/s/${token}/devtools/browser/${Math.random().toString(16).slice(2)}`;
+  const wsEndpoint = `ws://127.0.0.1:${BROKER_PORT}/s/${token}/devtools/browser/${Math.random().toString(16).slice(2)}`;
   const browser = await puppeteer.connect({ browserWSEndpoint: wsEndpoint, defaultViewport: null });
   const page = await browser.newPage();
   await page.goto(`data:text/html,<body style="margin:0;background:${color}"><h1 style="color:#fff;font-size:90px">${text}</h1></body>`);

@@ -2,29 +2,43 @@
 
 const { spawn } = require('node:child_process');
 const { randomUUID } = require('node:crypto');
-const { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } = require('node:fs');
-const { tmpdir } = require('node:os');
-const { dirname, isAbsolute, join, resolve } = require('node:path');
+const { existsSync } = require('node:fs');
+const { join, resolve } = require('node:path');
 
 const pluginRoot = resolve(__dirname, '..');
 const brokerPort = Number(process.env.ACS_BROKER_PORT || 9300);
-const display = process.env.ACS_DISPLAY || ':77';
-const token = process.env.ACS_SESSION_TOKEN || randomUUID();
-const brokerSessionUrl = `http://127.0.0.1:${brokerPort}/s/${encodeURIComponent(token)}`;
+const transportToken = process.env.ACS_SESSION_TOKEN || randomUUID();
+const trustedSessionId = process.env.BOTMUX_SESSION_ID?.trim() || null;
+const brokerSessionUrl = `http://127.0.0.1:${brokerPort}/s/${encodeURIComponent(transportToken)}`;
 const mcpEntry = process.env.ACS_MCP_BIN
   || join(pluginRoot, 'vendor', 'chrome-devtools-mcp', 'src', 'bin', 'chrome-devtools-mcp.js');
-const wsEndpoint = `ws://127.0.0.1:${brokerPort}/s/${token}/devtools/browser/${randomUUID().replaceAll('-', '')}`;
+const wsEndpoint = `ws://127.0.0.1:${brokerPort}/s/${transportToken}/devtools/browser/${randomUUID().replaceAll('-', '')}`;
+
+const SESSION_ENTRY_TOOL_NAMES = new Set([
+  'list_pages',
+  'new_page',
+  'browser_session_info',
+  'browser_session_set_writable',
+]);
+const SESSION_ID_SCHEMA = {
+  type: 'string',
+  minLength: 1,
+  maxLength: 128,
+  description: 'Stable session identifier. In botmux, pass the exact value from the current <session_id> context.',
+};
 
 const LOCAL_TOOLS = [
   {
     name: 'browser_session_info',
     description: 'Get the visible Agent Chrome window, noVNC URL, and interaction state for this MCP session.',
-    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-  },
-  {
-    name: 'browser_session_get_vnc_url',
-    description: 'Get the noVNC URL for viewing or taking over this MCP session browser window.',
-    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: SESSION_ID_SCHEMA,
+      },
+      required: ['sessionId'],
+      additionalProperties: false,
+    },
   },
   {
     name: 'browser_session_set_writable',
@@ -32,57 +46,11 @@ const LOCAL_TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        sessionId: SESSION_ID_SCHEMA,
         writable: { type: 'boolean', description: 'True allows noVNC input; false returns to view-only mode.' },
+        mode: { type: 'string', enum: ['follow', 'free'], default: 'follow' },
       },
-      required: ['writable'],
-      additionalProperties: false,
-    },
-  },
-  {
-    name: 'browser_session_screenshot',
-    description: 'Capture the native Agent Chrome window for this MCP session, including browser chrome.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        filePath: { type: 'string', description: 'Optional absolute path, or path relative to the MCP working directory, ending in .png.' },
-      },
-      additionalProperties: false,
-    },
-  },
-  {
-    name: 'browser_session_activate',
-    description: 'Bring the native Agent Chrome window for this MCP session to the front.',
-    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-  },
-  {
-    name: 'browser_session_send_keys',
-    description: 'Send a bounded list of xdotool key expressions to this MCP session browser window.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        keys: {
-          type: 'array',
-          items: { type: 'string', minLength: 1, maxLength: 128 },
-          minItems: 1,
-          maxItems: 32,
-          description: 'Key expressions such as Control_L+l, Return, or Escape.',
-        },
-      },
-      required: ['keys'],
-      additionalProperties: false,
-    },
-  },
-  {
-    name: 'browser_session_click',
-    description: 'Click native window coordinates inside this MCP session browser window.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        x: { type: 'integer', minimum: 0 },
-        y: { type: 'integer', minimum: 0 },
-        button: { type: 'integer', minimum: 1, maximum: 5, default: 1 },
-      },
-      required: ['x', 'y'],
+      required: ['sessionId', 'writable'],
       additionalProperties: false,
     },
   },
@@ -102,11 +70,11 @@ function errorResult(error) {
   return textResult(message, { isError: true });
 }
 
-async function fetchJson(url) {
+async function fetchJson(url, options) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 3000);
   try {
-    const response = await fetch(url, { signal: controller.signal });
+    const response = await fetch(url, { ...options, signal: controller.signal });
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body?.error || `Agent Chrome broker returned HTTP ${response.status}`);
     return body;
@@ -117,7 +85,8 @@ async function fetchJson(url) {
 
 function safeManifest(manifest) {
   return {
-    display: manifest.DISPLAY || display,
+    botmuxSessionId: manifest.botmuxSessionId || null,
+    display: manifest.DISPLAY || null,
     geometry: manifest.geometry || null,
     windowIds: Array.isArray(manifest.windowIds) ? manifest.windowIds : [],
     primaryWindowId: manifest.primaryWindowId || null,
@@ -125,6 +94,18 @@ function safeManifest(manifest) {
     novncPort: manifest.novncPort || null,
     novncUrl: manifest.novncUrl || null,
     viewonly: manifest.viewonly !== false,
+    mode: manifest.mode === 'free' ? 'free' : 'follow',
+    agentActiveTargetId: manifest.agentActiveTargetId || null,
+    pages: Array.isArray(manifest.pages) ? manifest.pages.map(page => ({
+      targetId: page.targetId,
+      windowId: page.windowId,
+      title: page.title || '',
+      url: page.url || '',
+      createdAt: page.createdAt || null,
+      lastActiveAt: page.lastActiveAt || null,
+    })) : [],
+    follow: manifest.follow || null,
+    free: manifest.free || { enabled: false },
     updatedAt: manifest.updatedAt || null,
   };
 }
@@ -133,44 +114,50 @@ async function manifest() {
   return safeManifest(await fetchJson(`${brokerSessionUrl}/manifest`));
 }
 
-async function primaryWindow() {
-  const current = await manifest();
-  if (!current.primaryWindowId) throw new Error('No visible Agent Chrome window exists yet. Open a page first.');
-  return { current, windowId: String(current.primaryWindowId) };
-}
-
-async function windowSize(windowId) {
-  const { stdout } = await run('xdotool', ['getwindowgeometry', '--shell', windowId], { env: { DISPLAY: display } });
-  const width = Number(stdout.match(/^WIDTH=(\d+)$/m)?.[1]);
-  const height = Number(stdout.match(/^HEIGHT=(\d+)$/m)?.[1]);
-  if (!Number.isInteger(width) || !Number.isInteger(height)) throw new Error('Could not read the Agent Chrome window bounds');
-  return { width, height };
-}
-
-function run(file, args, options = {}) {
-  return new Promise((resolvePromise, reject) => {
-    const child = spawn(file, args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      ...options,
-      env: { ...process.env, ...options.env },
-    });
-    let stdout = '';
-    let stderr = '';
-    child.stdout?.setEncoding('utf8');
-    child.stderr?.setEncoding('utf8');
-    child.stdout?.on('data', chunk => { stdout += chunk; });
-    child.stderr?.on('data', chunk => { stderr += chunk; });
-    child.on('error', reject);
-    child.on('exit', code => {
-      if (code === 0) resolvePromise({ stdout, stderr });
-      else reject(new Error(`${file} exited with ${code}: ${stderr.trim() || stdout.trim()}`));
-    });
-  });
-}
-
 function requireObject(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   return value;
+}
+
+function normalizeSessionId(value) {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)) {
+    throw new Error('sessionId must be a non-empty identifier containing only letters, numbers, dot, underscore, colon, or hyphen');
+  }
+  if (trustedSessionId && value !== trustedSessionId) {
+    throw new Error('sessionId does not match the current botmux session');
+  }
+  return value;
+}
+
+let boundSessionId = null;
+let downstreamBound = false;
+
+async function registerBrokerBinding(sessionId) {
+  await fetchJson(`${brokerSessionUrl}/bind`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ sessionId }),
+  });
+}
+
+async function bindSession(rawArgs) {
+  const args = requireObject(rawArgs);
+  const sessionId = normalizeSessionId(args.sessionId);
+  if (boundSessionId && boundSessionId !== sessionId) {
+    throw new Error(`This MCP connection is already bound to session ${boundSessionId}`);
+  }
+  await registerBrokerBinding(sessionId);
+  boundSessionId = sessionId;
+  const forwarded = { ...args };
+  delete forwarded.sessionId;
+  return forwarded;
+}
+
+function withSessionIdSchema(tool) {
+  const schema = requireObject(tool.inputSchema);
+  const properties = { ...requireObject(schema.properties), sessionId: SESSION_ID_SCHEMA };
+  const required = [...new Set([...(Array.isArray(schema.required) ? schema.required : []), 'sessionId'])];
+  return { ...tool, inputSchema: { ...schema, type: 'object', properties, required } };
 }
 
 async function callLocalTool(name, rawArgs) {
@@ -179,70 +166,13 @@ async function callLocalTool(name, rawArgs) {
     const current = await manifest();
     return textResult(JSON.stringify(current, null, 2), { structuredContent: current });
   }
-  if (name === 'browser_session_get_vnc_url') {
-    const current = await manifest();
-    if (!current.novncUrl) throw new Error('The noVNC view is not ready yet. Open a page first.');
-    return textResult(current.novncUrl, { structuredContent: { url: current.novncUrl, viewonly: current.viewonly } });
-  }
   if (name === 'browser_session_set_writable') {
     if (typeof args.writable !== 'boolean') throw new Error('writable must be a boolean');
-    const state = await fetchJson(`${brokerSessionUrl}/viewonly?on=${args.writable ? '0' : '1'}`);
+    const mode = args.mode === 'free' ? 'free' : 'follow';
+    const state = await fetchJson(`${brokerSessionUrl}/viewonly?mode=${mode}&on=${args.writable ? '0' : '1'}`);
     if (!state.ok) throw new Error('Agent Chrome could not update the noVNC interaction mode');
-    const result = { writable: state.viewonly === false, viewonly: state.viewonly !== false };
+    const result = { mode, writable: state.viewonly === false, viewonly: state.viewonly !== false };
     return textResult(result.writable ? 'noVNC input enabled' : 'noVNC returned to view-only mode', { structuredContent: result });
-  }
-  if (name === 'browser_session_screenshot') {
-    const { windowId } = await primaryWindow();
-    const requestedPath = typeof args.filePath === 'string' && args.filePath.trim() ? args.filePath.trim() : undefined;
-    if (requestedPath && !requestedPath.toLowerCase().endsWith('.png')) throw new Error('filePath must end in .png');
-    const tempDir = requestedPath ? undefined : mkdtempSync(join(tmpdir(), 'agent-chrome-window-'));
-    const target = requestedPath
-      ? (isAbsolute(requestedPath) ? requestedPath : resolve(process.cwd(), requestedPath))
-      : join(tempDir, 'window.png');
-    mkdirSync(dirname(target), { recursive: true });
-    try {
-      await run('import', ['-window', windowId, target], { env: { DISPLAY: display } });
-      if (requestedPath) return textResult(`Saved native browser window screenshot to ${target}`, { structuredContent: { filePath: target } });
-      const data = readFileSync(target).toString('base64');
-      return {
-        content: [
-          { type: 'text', text: 'Captured the native browser window for this MCP session.' },
-          { type: 'image', data, mimeType: 'image/png' },
-        ],
-      };
-    } finally {
-      if (tempDir) rmSync(tempDir, { recursive: true, force: true });
-    }
-  }
-  if (name === 'browser_session_activate') {
-    const { windowId } = await primaryWindow();
-    try {
-      await run('xdotool', ['windowactivate', windowId], { env: { DISPLAY: display } });
-    } catch {
-      await run('xdotool', ['windowraise', windowId], { env: { DISPLAY: display } });
-    }
-    return textResult('Activated the native browser window for this MCP session.');
-  }
-  if (name === 'browser_session_send_keys') {
-    if (!Array.isArray(args.keys) || args.keys.length < 1 || args.keys.length > 32
-      || args.keys.some(key => typeof key !== 'string' || !/^[A-Za-z0-9_+:-]{1,128}$/.test(key))) {
-      throw new Error('keys must contain between 1 and 32 non-empty key expressions');
-    }
-    const { windowId } = await primaryWindow();
-    await run('xdotool', ['key', '--window', windowId, '--clearmodifiers', ...args.keys], { env: { DISPLAY: display } });
-    return textResult(`Sent ${args.keys.length} key expression(s) to this MCP session window.`);
-  }
-  if (name === 'browser_session_click') {
-    if (!Number.isInteger(args.x) || args.x < 0 || !Number.isInteger(args.y) || args.y < 0) {
-      throw new Error('x and y must be non-negative integers');
-    }
-    const button = args.button === undefined ? 1 : args.button;
-    if (!Number.isInteger(button) || button < 1 || button > 5) throw new Error('button must be an integer from 1 to 5');
-    const { windowId } = await primaryWindow();
-    const { width, height } = await windowSize(windowId);
-    if (args.x >= width || args.y >= height) throw new Error(`click coordinates must stay inside the ${width}x${height} session window`);
-    await run('xdotool', ['mousemove', '--window', windowId, String(args.x), String(args.y), 'click', String(button)], { env: { DISPLAY: display } });
-    return textResult(`Clicked (${args.x}, ${args.y}) in this MCP session window.`);
   }
   throw new Error(`Unknown Agent Chrome session tool: ${name}`);
 }
@@ -280,7 +210,7 @@ function processLines(stream, onLine) {
   });
 }
 
-processLines(process.stdin, line => {
+async function handleClientLine(line) {
   let message;
   try {
     message = JSON.parse(line);
@@ -292,15 +222,52 @@ processLines(process.stdin, line => {
   const method = message?.method;
   const id = message?.id;
   if (method === 'tools/call' && id !== undefined && LOCAL_TOOL_NAMES.has(message.params?.name)) {
-    void callLocalTool(message.params.name, message.params.arguments)
-      .then(result => writeMessage({ jsonrpc: '2.0', id, result }))
-      .catch(error => writeMessage({ jsonrpc: '2.0', id, result: errorResult(error) }));
+    try {
+      const args = await bindSession(message.params.arguments);
+      const result = await callLocalTool(message.params.name, args);
+      writeMessage({ jsonrpc: '2.0', id, result });
+    } catch (error) {
+      writeMessage({ jsonrpc: '2.0', id, result: errorResult(error) });
+    }
     return;
+  }
+  if (method === 'tools/call' && id !== undefined) {
+    const name = message.params?.name;
+    if (SESSION_ENTRY_TOOL_NAMES.has(name)) {
+      try {
+        message.params.arguments = await bindSession(message.params.arguments);
+      } catch (error) {
+        writeMessage({ jsonrpc: '2.0', id, result: errorResult(error) });
+        return;
+      }
+    } else if (!boundSessionId) {
+      writeMessage({
+        jsonrpc: '2.0',
+        id,
+        result: errorResult('No active Agent Chrome page for this MCP connection. Call list_pages or new_page with sessionId first.'),
+      });
+      return;
+    } else if (!downstreamBound) {
+      try {
+        await registerBrokerBinding(boundSessionId);
+      } catch (error) {
+        writeMessage({ jsonrpc: '2.0', id, result: errorResult(error) });
+        return;
+      }
+    }
+    downstreamBound = true;
   }
   if (method === 'tools/list' && id !== undefined) {
     pending.set(idKey(id), { method: 'tools/list', includeLocal: !message.params?.cursor });
   }
-  downstream.stdin.write(`${line}\n`);
+  downstream.stdin.write(`${JSON.stringify(message)}\n`);
+}
+
+let clientQueue = Promise.resolve();
+processLines(process.stdin, line => {
+  clientQueue = clientQueue
+    .then(() => handleClientLine(line))
+    .catch(error => process.stderr.write(`agent-chrome: request handling failed: ${error.message}\n`));
 });
 
 processLines(downstream.stdout, line => {
@@ -317,6 +284,9 @@ processLines(downstream.stdout, line => {
     const request = pending.get(key);
     pending.delete(key);
     if (request?.method === 'tools/list' && request.includeLocal && Array.isArray(message.result?.tools)) {
+      message.result.tools = message.result.tools.map(tool => (
+        SESSION_ENTRY_TOOL_NAMES.has(tool?.name) ? withSessionIdSchema(tool) : tool
+      ));
       const names = new Set(message.result.tools.map(tool => tool?.name));
       message.result.tools.push(...LOCAL_TOOLS.filter(tool => !names.has(tool.name)));
     }
@@ -324,7 +294,9 @@ processLines(downstream.stdout, line => {
   writeMessage(message);
 });
 
-process.stdin.on('end', () => downstream.stdin.end());
+process.stdin.on('end', () => {
+  void clientQueue.finally(() => downstream.stdin.end());
+});
 downstream.on('error', error => {
   process.stderr.write(`agent-chrome: failed to start chrome-devtools-mcp: ${error.message}\n`);
   process.exitCode = 1;

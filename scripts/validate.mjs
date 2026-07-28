@@ -33,7 +33,9 @@ if (pkg.publishConfig?.registry !== 'https://registry.npmjs.org/' || pkg.publish
 }
 if (Object.keys(pkg.dependencies ?? {}).length !== 0) fail('runtime dependencies must be bundled into dist/');
 if (pkg.devDependencies?.['chrome-devtools-mcp'] !== '1.5.0') fail('chrome-devtools-mcp build input must stay pinned');
+if (pkg.devDependencies?.['@novnc/novnc'] !== '1.7.0') fail('noVNC build input must stay pinned');
 if (!pkg.devDependencies?.esbuild) fail('esbuild is required to bundle the plugin runtime');
+if (!pkg.devDependencies?.react) fail('React is required to build the plugin dashboard component');
 
 for (const required of [
   'dist/package.json',
@@ -46,9 +48,13 @@ for (const required of [
   'dist/dashboard/index.js',
   'dist/mcp/index.json',
   'dist/mcp/server.js',
+  'dist/novnc/LICENSE.txt',
+  'dist/novnc/viewer.js',
+  'dist/novnc/vnc.html',
   'dist/service/index.js',
   'dist/service/runner.js',
   'dist/skills/agent-chrome/SKILL.md',
+  'dist/botmux-build/stamp',
   'dist/vendor/chrome-devtools-mcp/package.json',
   'dist/vendor/chrome-devtools-mcp/LICENSE',
   'dist/vendor/chrome-devtools-mcp/src/bin/chrome-devtools-mcp.js',
@@ -72,18 +78,54 @@ const mcpServer = readFileSync('dist/mcp/server.js', 'utf-8');
 if (!mcpServer.includes('"vendor"') || !mcpServer.includes('"chrome-devtools-mcp"')) {
   fail('composite MCP server must proxy the bundled Chrome DevTools MCP');
 }
-for (const tool of [
-  'browser_session_info',
+for (const tool of ['browser_session_info', 'browser_session_set_writable']) {
+  if (!mcpServer.includes(tool)) fail(`composite MCP server is missing ${tool}`);
+}
+for (const removedTool of [
   'browser_session_get_vnc_url',
-  'browser_session_set_writable',
   'browser_session_screenshot',
   'browser_session_activate',
+  'browser_session_send_keys',
+  'browser_session_click',
 ]) {
-  if (!mcpServer.includes(tool)) fail(`composite MCP server is missing ${tool}`);
+  if (mcpServer.includes(removedTool)) fail(`composite MCP server still exposes removed tool ${removedTool}`);
+}
+for (const marker of ['list_pages', 'new_page', 'sessionId', '/bind', 'No active Agent Chrome page']) {
+  if (!mcpServer.includes(marker)) fail(`composite MCP server is missing session binding marker: ${marker}`);
+}
+
+const broker = readFileSync('dist/bin/broker.js', 'utf-8');
+for (const marker of ['.agent-chrome', 'websockify exited with', 'transportBindings', 'reconnectGraceMs', 'serviceInstanceId']) {
+  if (!broker.includes(marker)) fail(`broker is missing runtime lifecycle marker: ${marker}`);
+}
+if (broker.includes('-nocursorshape')) {
+  fail('x11vnc must send CursorShape updates so the browser can render a low-latency cursor');
+}
+if (broker.includes('process.chdir(') || broker.includes('cwd: CFG.runtimeDir')) {
+  fail('broker and VNC subprocesses must keep the plugin runtime working directory');
+}
+const runtimeEnv = readFileSync('dist/bin/env.sh', 'utf-8');
+if (!runtimeEnv.includes('/.agent-chrome')) fail('runtime data must default to ~/.agent-chrome');
+if (!runtimeEnv.includes('$ACS_ROOT/novnc')) fail('runtime must serve the bundled noVNC viewer');
+const stackLauncher = readFileSync('dist/bin/acs-up.sh', 'utf-8');
+if (stackLauncher.includes('cd "$ACS_RUN"')) fail('stack launcher must not migrate process cwd into the data directory');
+if (!stackLauncher.includes('--prepare-only')) fail('stack launcher must let the service runner prepare Chrome without detaching the broker');
+const serviceRunner = readFileSync('dist/service/runner.js', 'utf-8');
+for (const marker of ['ACS_SERVICE_INSTANCE_ID', 'ACS_NOVNC_WEB', 'managed child ready', 'replacing existing listener', 'cleanPreviousBuilds']) {
+  if (!serviceRunner.includes(marker)) fail(`service runner is missing broker ownership marker: ${marker}`);
 }
 
 const commandIndex = readJson('dist/cli/commands.json');
 if (!commandIndex.commands?.some(command => command.name === 'agent-chrome:status')) fail('missing CLI command');
+
+const dashboard = readFileSync('dist/dashboard/index.js', 'utf-8');
+for (const marker of ['ac-session-list', 'view-mode', '/api/sessions', 'free-target', 'novncUrl']) {
+  if (!dashboard.includes(marker)) fail(`dashboard is missing ${marker}`);
+}
+const viewer = readFileSync('dist/novnc/viewer.js', 'utf-8');
+for (const marker of ['scaleViewport', 'ResizeObserver', 'cursorDisplayScale', 'websockify']) {
+  if (!viewer.includes(marker)) fail(`bundled noVNC viewer is missing ${marker}`);
+}
 
 const cleanRoot = mkdtempSync(join(tmpdir(), 'agent-chrome-dist-'));
 try {
@@ -94,6 +136,9 @@ try {
   const service = cleanRequire(join(cleanRoot, 'service', 'index.js'));
   if (service?.mode !== 'auto') fail('clean dist service should use auto mode');
   if (service?.pm2?.script !== './service/runner.js') fail('clean dist service bundle is not loadable');
+  if (service?.pm2?.cwd !== undefined) fail('service cwd must remain the plugin runtime directory managed by Botmux');
+  if (service?.pm2?.killTimeoutMs !== 10_000) fail('service must allow the managed broker to stop gracefully');
+  if (service?.pm2?.watchDelayMs !== 2_000) fail('linked development must wait for an atomic build before restart');
 
   const vendoredMcp = spawnSync(process.execPath, [
     join(cleanRoot, 'vendor', 'chrome-devtools-mcp', 'src', 'bin', 'chrome-devtools-mcp.js'),

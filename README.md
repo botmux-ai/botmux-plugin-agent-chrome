@@ -1,8 +1,8 @@
 # Agent Chrome Plugin
 
 Botmux plugin packaging for ACS — Agent Chrome Stack. It provides one shared
-headful Chrome instance, per-session CDP isolation, and per-session noVNC views
-for agent CLIs.
+headful Chrome instance, per-session CDP isolation, and two noVNC viewing modes
+for each agent CLI session: Follow Agent and Free Browsing.
 
 GitHub: https://github.com/botmux-ai/botmux-plugin-agent-chrome
 
@@ -13,8 +13,11 @@ this repository and generated under the installed plugin directory.
 ## Requirements
 
 - Linux with Node.js 20+, npm, Botmux, and Chrome or Chromium.
-- Xvfb, openbox, xcompmgr, wmctrl, x11vnc, websockify/noVNC, xdotool,
+- Xvfb, openbox, xcompmgr, wmctrl, x11vnc, websockify, xdotool,
   ImageMagick, and curl.
+
+The noVNC browser client is bundled into the plugin so its low-latency cursor
+can be scaled with the embedded Dashboard viewport.
 
 `chrome-devtools-mcp@1.5.0` is a pinned build input vendored into the plugin's
 self-contained `dist/`. MCP startup uses that bundled runtime and does not keep
@@ -26,7 +29,7 @@ On Debian or Ubuntu, install the system tools with:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y xvfb openbox xcompmgr wmctrl x11vnc websockify novnc \
+sudo apt-get install -y xvfb openbox xcompmgr wmctrl x11vnc websockify \
   xdotool imagemagick curl
 ```
 
@@ -54,7 +57,7 @@ Use a `file:` URL so Botmux lets npm unpack the tarball and persist only its
 self-contained `dist/` runtime:
 
 ```bash
-botmux plugin install "file:/absolute/path/agent-chrome-botmux-plugin-0.1.1.tgz"
+botmux plugin install "file:/absolute/path/botmux-ai-plugin-agent-chrome-0.2.0.tgz"
 botmux plugin enable agent-chrome
 botmux plugin service start agent-chrome
 botmux plugin service status
@@ -82,8 +85,34 @@ The service uses `auto` mode. `botmux start` and the start phase of
 service should stop with the core. It remains controllable from Dashboard and
 with `botmux plugin service start|stop|restart agent-chrome`.
 
+Profile, session manifests, and logs live under `~/.agent-chrome` by default,
+separate from the replaceable plugin runtime. Before reinstalling, updating, or
+uninstalling the plugin, stop its service explicitly:
+
+```bash
+botmux plugin service stop agent-chrome
+```
+
+Botmux rejects the lifecycle operation while the service is still running; it
+does not stop the service implicitly.
+
 Start a new Codex/agent session after enabling the plugin so it reloads the
 `agent-chrome` MCP configuration and skill.
+
+Open the Agent Chrome page from the Botmux Dashboard after an agent creates its
+first browser page. The page joins each browser connection to its Botmux CLI
+session and provides:
+
+- A session list, with the Bot name and CLI shown as secondary context.
+- **Follow Agent**, which tracks the page currently operated by the agent.
+- **Free Browsing**, which keeps one stable noVNC URL while you switch among the
+  pages owned by that session.
+- View-only mode by default, with an explicit switch for keyboard and mouse
+  input.
+- Copy-link and independent-window actions for the current noVNC stream.
+
+The independent-window action currently opens the raw noVNC view. A dedicated
+standalone viewer with its own page switcher is intentionally deferred.
 
 ## Local Development
 
@@ -105,7 +134,7 @@ only `dist/`.
 ACS provides:
 
 - Single shared Chrome profile for live login reuse.
-- Per-session broker tokens and target filtering.
+- Stable Botmux session binding and per-session target filtering.
 - Per-session kiosk windows and noVNC views.
 - MCP connection through `bin/mcp-launch.sh`.
 - Structured native browser-session tools through the Agent Chrome MCP.
@@ -127,16 +156,23 @@ curl http://127.0.0.1:9300/health
 curl http://127.0.0.1:9300/sessions
 ```
 
-The Agent Chrome MCP adds these session-scoped tools alongside the standard
-Chrome DevTools tools:
+The Agent Chrome MCP adds two session-scoped tools alongside the standard Chrome
+DevTools tools:
 
 - `browser_session_info`
-- `browser_session_get_vnc_url`
 - `browser_session_set_writable`
-- `browser_session_screenshot`
-- `browser_session_activate`
-- `browser_session_send_keys`
-- `browser_session_click`
+
+Four entry tools require the exact current Botmux `<session_id>` in a
+`sessionId` argument: `list_pages`, `new_page`, `browser_session_info`, and
+`browser_session_set_writable`. The wrapper consumes that argument, binds its
+short-lived MCP transport to the stable Botmux session, and does not forward the
+extra argument to the upstream Chrome DevTools MCP. All other Chrome tools reuse
+the established binding. The stable session id is identity only; broker access
+continues to use a separate random transport token.
+
+If the CLI/MCP process reconnects, a new transport can rebind to the same
+`sessionId` during the broker grace period, preserving its pages and noVNC view.
+`browser_session_info` includes both follow and free-view noVNC URLs.
 
 `bin/browser-session` remains available for operator diagnostics only and
 requires an explicit `ACS_SESSION_TOKEN`. Agents should use the MCP tools.
@@ -162,8 +198,9 @@ The original ACS test scripts are preserved under `test/`:
 - `check-vnc.js`
 - `check-puppeteer.js`
 - `check-writable-toggle.js`
+- `check-view-modes.js`
 - `check-3session.js`
 - `check-mcp-e2e.js`
 
-These tests require Chrome, Xvfb, xdotool, x11vnc, websockify/noVNC, and the
+These tests require Chrome, Xvfb, xdotool, x11vnc, websockify, and the
 local machine runtime environment.

@@ -13,7 +13,9 @@ declare -a TESTS=(
   "noVNC就绪:check-vnc.js"
   "真实puppeteer隔离:check-puppeteer.js"
   "只读可写切换:check-writable-toggle.js"
+  "Follow/自由浏览状态机:check-view-modes.js"
   "3并发session隔离:check-3session.js"
+  "并发创建归属回归:check-concurrent-create.js"
   "端到端真实MCP:check-mcp-e2e.js"
 )
 pass=0; fail=0

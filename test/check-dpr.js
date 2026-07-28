@@ -2,7 +2,7 @@
 // 对齐 16" MBP：DPR=2、视口 1728x1117。
 const { CDP, waitManifest } = require('../lib/cdp');
 
-const BROKER = 'http://127.0.0.1:9300';
+const BROKER = `http://127.0.0.1:${process.env.ACS_BROKER_PORT || 9300}`;
 const TOKEN = 'dpr' + Date.now();
 
 (async () => {
@@ -11,6 +11,7 @@ const TOKEN = 'dpr' + Date.now();
     url: 'about:blank', newWindow: true,
     width: 1728, height: 1117,
   });
+  const mf = await waitManifest(BROKER, TOKEN);
   const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
   await cdp.send('Runtime.enable', {}, sessionId);
   const r = await cdp.send('Runtime.evaluate', {
@@ -18,7 +19,6 @@ const TOKEN = 'dpr' + Date.now();
     returnByValue: true,
   }, sessionId);
   const vp = r.result.value;
-  const mf = await waitManifest(BROKER, TOKEN);
   console.log('viewport:', JSON.stringify(vp));
   console.log('manifest:', JSON.stringify(mf));
   const pass = vp.dpr === 2 && vp.w === 1728 && vp.h === 1117 && mf && mf.primaryWindowId;

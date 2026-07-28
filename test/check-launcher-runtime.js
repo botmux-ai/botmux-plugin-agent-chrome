@@ -40,6 +40,7 @@ function runLauncher(extraEnv, sendInitialize) {
       env: {
         ...process.env,
         ACS_ROOT: temp,
+        ACS_DATA_ROOT: temp,
         ACS_RUN: join(temp, 'run'),
         ACS_MCP_BIN: fakeMcp,
         ...extraEnv,

@@ -8,15 +8,20 @@ description: Use the Agent Chrome Stack browser session provided by botmux.
 Use the `agent-chrome` MCP server for all browser automation and visible-session
 operations. Do not access the shared X11 display directly.
 
-Use the regular Chrome DevTools tools for pages and DOM interactions. Use the
-structured session tools only when the task needs the native browser window:
+Pass the exact current Botmux `<session_id>` as `sessionId` whenever calling one
+of these session-entry tools:
 
-- `browser_session_info`: inspect the current window and noVNC state.
-- `browser_session_get_vnc_url`: get the human-viewable noVNC URL.
-- `browser_session_set_writable`: allow or prevent human noVNC input.
-- `browser_session_screenshot`: capture the native browser window.
-- `browser_session_activate`: bring the native window to the front.
-- `browser_session_send_keys` and `browser_session_click`: use bounded native
-  input only when browser chrome or another non-DOM surface requires it.
+- `list_pages`
+- `new_page`
+- `browser_session_info`
+- `browser_session_set_writable`
+
+The entry call binds this MCP connection to that stable Botmux session. Other
+Chrome DevTools tools then inherit the binding and do not accept `sessionId`.
+Never invent or reuse a session id from another conversation.
+
+Use `browser_session_info` to inspect the current pages, follow/free view state,
+and human-viewable noVNC URLs. Use `browser_session_set_writable` to allow or
+prevent human noVNC input.
 
 Prefer the normal page-level MCP tools whenever they can complete the task.

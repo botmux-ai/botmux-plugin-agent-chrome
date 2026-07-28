@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>Agent Chrome</title>
+  <style>
+    html,body,#screen{width:100%;height:100%;margin:0;overflow:hidden;background:#11151b}
+    #screen{display:flex;align-items:center;justify-content:center}
+    #status{position:fixed;z-index:2;left:50%;top:50%;transform:translate(-50%,-50%);max-width:min(420px,calc(100% - 40px));padding:10px 14px;border:1px solid #343c49;border-radius:6px;background:rgba(17,21,27,.9);color:#c7cdd6;font:13px/1.5 Inter,system-ui,sans-serif;text-align:center;pointer-events:none}
+    #status[data-error="true"]{border-color:#a83b3b;color:#ffd2d2}
+  </style>
+</head>
+<body>
+  <div id="screen"></div>
+  <div id="status">正在连接浏览器画面...</div>
+  <script type="module" src="./viewer.js"></script>
+</body>
+</html>

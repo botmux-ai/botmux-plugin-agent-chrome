@@ -1,115 +1,176 @@
 'use strict';
-// 端到端：像 CLI 那样把 mcp-launch.sh 当 MCP 的启动命令拉起，走真正的
-// chrome-devtools-mcp，用最小 MCP(JSON-RPC over stdio) 客户端驱动它：
-// initialize → new_page → list_pages，验证整条 CLI→wrapper→MCP→broker→chrome 链路。
-const { spawn, execSync } = require('child_process');
-const { existsSync, rmSync } = require('fs');
-const path = require('path');
+// End to end: start mcp-launch.sh exactly as a CLI does, then drive the real
+// chrome-devtools-mcp through initialize -> bind -> new_page -> list_pages.
+const { spawn, execSync } = require('node:child_process');
+const path = require('node:path');
 
 const WRAPPER = path.join(__dirname, '..', 'dist', 'bin', 'mcp-launch.sh');
-const FIXED_TOKEN = 'e2e' + Date.now();
+const FIXED_TOKEN = `e2e${Date.now()}`;
+const BOTMUX_SESSION_ID = `botmux-mcp-e2e-${Date.now()}`;
+const BROKER_PORT = process.env.ACS_BROKER_PORT || 9300;
+const BROKER = `http://127.0.0.1:${BROKER_PORT}`;
 
 const child = spawn('bash', [WRAPPER], {
-  env: { ...process.env, ACS_SESSION_TOKEN: FIXED_TOKEN },
+  env: {
+    ...process.env,
+    ACS_SESSION_TOKEN: FIXED_TOKEN,
+    BOTMUX_SESSION_ID,
+  },
   stdio: ['pipe', 'pipe', 'pipe'],
 });
 
-let buf = '';
+let buffer = '';
 const waiters = [];
-child.stdout.on('data', (d) => {
-  buf += d.toString();
-  let i;
-  while ((i = buf.indexOf('\n')) >= 0) {
-    const line = buf.slice(0, i); buf = buf.slice(i + 1);
+child.stdout.on('data', chunk => {
+  buffer += chunk.toString();
+  let newline;
+  while ((newline = buffer.indexOf('\n')) >= 0) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
     if (!line.trim()) continue;
-    let msg; try { msg = JSON.parse(line); } catch { continue; }
-    for (let k = waiters.length - 1; k >= 0; k--) {
-      if (waiters[k].match(msg)) { waiters[k].resolve(msg); waiters.splice(k, 1); }
+    let message;
+    try { message = JSON.parse(line); } catch { continue; }
+    for (let index = waiters.length - 1; index >= 0; index--) {
+      if (!waiters[index].match(message)) continue;
+      waiters[index].resolve(message);
+      waiters.splice(index, 1);
     }
   }
 });
 let stderr = '';
-child.stderr.on('data', (d) => { stderr += d.toString(); });
+child.stderr.on('data', chunk => { stderr += chunk.toString(); });
 
 let id = 0;
 function rpc(method, params) {
-  const myId = ++id;
-  const p = new Promise((resolve) => waiters.push({ match: (m) => m.id === myId, resolve }));
-  child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: myId, method, params }) + '\n');
-  return p;
+  const requestId = ++id;
+  const response = new Promise(resolve => waiters.push({ match: message => message.id === requestId, resolve }));
+  child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: requestId, method, params })}\n`);
+  return response;
 }
-function notify(method, params) { child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n'); }
-const txt = (r) => (r.result && r.result.content || []).map((c) => c.text || '').join('\n');
+function notify(method, params) {
+  child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method, params })}\n`);
+}
+function text(result) {
+  return (result.result?.content || []).map(content => content.text || '').join('\n');
+}
 
 (async () => {
-  await rpc('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'e2e', version: '1' } });
+  await rpc('initialize', {
+    protocolVersion: '2024-11-05',
+    capabilities: {},
+    clientInfo: { name: 'e2e', version: '1' },
+  });
   notify('notifications/initialized', {});
 
-  const tools = await rpc('tools/list', {});
-  const toolNames = new Set((tools.result?.tools || []).map(tool => tool.name));
+  const listedTools = await rpc('tools/list', {});
+  const tools = new Map((listedTools.result?.tools || []).map(tool => [tool.name, tool]));
   const requiredSessionTools = [
+    'list_pages',
+    'new_page',
     'browser_session_info',
-    'browser_session_get_vnc_url',
     'browser_session_set_writable',
+  ];
+  const removedSessionTools = [
+    'browser_session_get_vnc_url',
     'browser_session_screenshot',
     'browser_session_activate',
+    'browser_session_send_keys',
+    'browser_session_click',
   ];
-  const toolsMerged = toolNames.has('new_page') && requiredSessionTools.every(name => toolNames.has(name));
-  console.log('composite tools merged:', toolsMerged);
+  const toolsMerged = requiredSessionTools.every(name => tools.has(name))
+    && requiredSessionTools.every(name => tools.get(name).inputSchema?.required?.includes('sessionId'))
+    && removedSessionTools.every(name => !tools.has(name));
+  console.log('composite tools and session schemas:', toolsMerged);
 
-  // 新开一个页
-  const np = await rpc('tools/call', { name: 'new_page', arguments: { url: 'about:blank' } });
-  const newPageOk = /about:blank/.test(txt(np));
+  const unbound = await rpc('tools/call', { name: 'take_snapshot', arguments: {} });
+  const unboundRejected = unbound.result?.isError === true && /list_pages or new_page/.test(text(unbound));
+  console.log('unbound non-entry rejected:', unboundRejected);
+
+  const newPage = await rpc('tools/call', {
+    name: 'new_page',
+    arguments: { sessionId: BOTMUX_SESSION_ID, url: 'about:blank' },
+  });
+  const newPageOk = /about:blank/.test(text(newPage));
   console.log('new_page ok:', newPageOk);
 
-  // 列出页面（应只有本 session 的）
-  const lp = await rpc('tools/call', { name: 'list_pages', arguments: {} });
-  const listed = txt(lp);
-  const pageListed = /about:blank/.test(listed);
+  const listPages = await rpc('tools/call', {
+    name: 'list_pages',
+    arguments: { sessionId: BOTMUX_SESSION_ID },
+  });
+  const pageListed = /about:blank/.test(text(listPages));
   console.log('list_pages includes page:', pageListed);
 
-  // broker 侧应看到本 token 的连接 + manifest
-  let mf = {};
-  for (let i=0;i<60;i++){ try { mf = JSON.parse(execSync(`curl -fsS http://127.0.0.1:9300/s/${FIXED_TOKEN}/manifest`, {encoding:'utf8'})); if (mf.primaryWindowId) break; } catch {} await new Promise(r=>setTimeout(r,150)); }
-  console.log('manifest novncUrl:', mf.novncUrl || '(none)');
+  let manifest = {};
+  for (let attempt = 0; attempt < 60; attempt++) {
+    try {
+      manifest = JSON.parse(execSync(`curl -fsS ${BROKER}/s/${FIXED_TOKEN}/manifest`, { encoding: 'utf8' }));
+      if (manifest.primaryWindowId && manifest.novncUrl) break;
+    } catch {}
+    await new Promise(resolve => setTimeout(resolve, 150));
+  }
+  console.log('manifest novncUrl:', manifest.novncUrl || '(none)');
+  const sessionLinked = manifest.token === FIXED_TOKEN
+    && manifest.botmuxSessionId === BOTMUX_SESSION_ID
+    && manifest.pages?.length === 1;
+  console.log('stable botmux session linked:', sessionLinked);
 
-  const sessionInfo = await rpc('tools/call', { name: 'browser_session_info', arguments: {} });
-  const infoText = txt(sessionInfo);
-  const infoOk = /primaryWindowId/.test(infoText) && !infoText.includes(FIXED_TOKEN);
-  console.log('session info sanitized:', infoOk);
+  const sessionInfo = await rpc('tools/call', {
+    name: 'browser_session_info',
+    arguments: { sessionId: BOTMUX_SESSION_ID },
+  });
+  const infoText = text(sessionInfo);
+  const infoOk = /primaryWindowId/.test(infoText)
+    && /vnc\.html/.test(infoText)
+    && !infoText.includes(FIXED_TOKEN);
+  console.log('session info sanitized with VNC:', infoOk);
 
-  const vnc = await rpc('tools/call', { name: 'browser_session_get_vnc_url', arguments: {} });
-  const vncOk = /vnc\.html/.test(txt(vnc));
-  console.log('session vnc:', vncOk);
+  const freeResponse = await fetch(`${BROKER}/s/${FIXED_TOKEN}/view-mode`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ mode: 'free' }),
+  });
+  const freeManifest = await freeResponse.json();
+  for (let attempt = 0; attempt < 40 && !freeManifest.free?.novncUrl; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 100));
+    try {
+      Object.assign(freeManifest, JSON.parse(execSync(`curl -fsS ${BROKER}/s/${FIXED_TOKEN}/manifest`, { encoding: 'utf8' })));
+    } catch {}
+  }
+  const freeVncOk = freeResponse.ok && freeManifest.free?.enabled === true && /vnc\.html/.test(freeManifest.free?.novncUrl || '');
+  console.log('session free VNC:', freeVncOk);
 
-  const writable = await rpc('tools/call', { name: 'browser_session_set_writable', arguments: { writable: true } });
-  const readonly = await rpc('tools/call', { name: 'browser_session_set_writable', arguments: { writable: false } });
-  const writableOk = /enabled/.test(txt(writable)) && /view-only/.test(txt(readonly));
+  const writable = await rpc('tools/call', {
+    name: 'browser_session_set_writable',
+    arguments: { sessionId: BOTMUX_SESSION_ID, writable: true },
+  });
+  const readonly = await rpc('tools/call', {
+    name: 'browser_session_set_writable',
+    arguments: { sessionId: BOTMUX_SESSION_ID, writable: false },
+  });
+  const freeWritable = await rpc('tools/call', {
+    name: 'browser_session_set_writable',
+    arguments: { sessionId: BOTMUX_SESSION_ID, mode: 'free', writable: true },
+  });
+  const writableOk = /enabled/.test(text(writable))
+    && /view-only/.test(text(readonly))
+    && /enabled/.test(text(freeWritable));
   console.log('session writable toggle:', writableOk);
 
-  const shot = path.join('/tmp', `agent-chrome-mcp-${FIXED_TOKEN}.png`);
-  const screenshot = await rpc('tools/call', { name: 'browser_session_screenshot', arguments: { filePath: shot } });
-  const screenshotOk = existsSync(shot) && /Saved native browser window screenshot/.test(txt(screenshot));
-  console.log('session native screenshot:', screenshotOk);
-  rmSync(shot, { force: true });
+  const mismatched = await rpc('tools/call', {
+    name: 'list_pages',
+    arguments: { sessionId: 'another-session' },
+  });
+  const mismatchRejected = mismatched.result?.isError === true && /does not match/.test(text(mismatched));
+  console.log('mismatched session rejected:', mismatchRejected);
 
-  const activated = await rpc('tools/call', { name: 'browser_session_activate', arguments: {} });
-  const keys = await rpc('tools/call', { name: 'browser_session_send_keys', arguments: { keys: ['Escape'] } });
-  const click = await rpc('tools/call', { name: 'browser_session_click', arguments: { x: 10, y: 10 } });
-  const nativeInputOk = /Activated/.test(txt(activated))
-    && /Sent 1 key/.test(txt(keys))
-    && /Clicked/.test(txt(click));
-  console.log('session bounded native input:', nativeInputOk);
-
-  const unsafeKeys = await rpc('tools/call', { name: 'browser_session_send_keys', arguments: { keys: ['--window', '1'] } });
-  const outsideClick = await rpc('tools/call', { name: 'browser_session_click', arguments: { x: 999999, y: 999999 } });
-  const nativeInputBounded = unsafeKeys.result?.isError === true && outsideClick.result?.isError === true;
-  console.log('session native input rejects escape attempts:', nativeInputBounded);
-
-  const pass = toolsMerged && newPageOk && pageListed && mf.novncUrl
-    && infoOk && vncOk && writableOk && screenshotOk && nativeInputOk && nativeInputBounded;
-  console.log(pass ? 'PASS: 端到端（真实 MCP）链路打通且被管理' : 'FAIL');
+  const pass = toolsMerged && unboundRejected && newPageOk && pageListed
+    && manifest.novncUrl && sessionLinked && infoOk && freeVncOk && writableOk && mismatchRejected;
+  console.log(pass ? 'PASS: real MCP chain uses stable Botmux session context' : 'FAIL');
 
   child.kill('SIGTERM');
   setTimeout(() => process.exit(pass ? 0 : 1), 500);
-})().catch((e) => { console.error('ERR', e, '\nSTDERR:', stderr.slice(-500)); child.kill(); process.exit(1); });
+})().catch(error => {
+  console.error('ERR', error, `\nSTDERR: ${stderr.slice(-500)}`);
+  child.kill();
+  process.exit(1);
+});
