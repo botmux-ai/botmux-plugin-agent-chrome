@@ -1,6 +1,6 @@
 name: publish
 
-# 只在 master 上打 v* tag 时触发，自动发版到 npm。
+# 只在 main 上打 v* tag 时触发，自动发版到 npm。
 # 前置条件：仓库 Settings → Secrets 配置 NPM_TOKEN（有 @botmux-ai 发布权限）。
 on:
   push:
@@ -19,11 +19,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Verify tag points to master
+      - name: Verify tag points to main
         run: |
-          git fetch origin master
-          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/master; then
-            echo "::error::tag ${GITHUB_REF_NAME} does not point to master"
+          git fetch origin main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not point to main"
             exit 1
           fi
 

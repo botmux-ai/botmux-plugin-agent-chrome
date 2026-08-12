@@ -46,20 +46,20 @@ npm test           # build + validate + 全部 hermetic 检查（不需要真实
 
 ## 发版流程（tag 触发 CI 自动发）
 
-**只在 master 打 `v*` tag 才会发版**，workflow 见
-`.github/workflows/publish.yml`：校验 tag 在 master 上 → 校验版本号一致 →
+**只在 main 打 `v*` tag 才会发版**，workflow 见
+`.github/workflows/publish.yml`：校验 tag 在 main 上 → 校验版本号一致 →
 `npm ci && npm test` → `npm publish`。
 
 步骤：
 
 ```bash
-# 1. 改版本号（走 PR，不能直推 master）
+# 1. 改版本号（走 PR，不能直推 main）
 git checkout -b release/x.y.z
 npm version x.y.z --no-git-tag-version   # 同步改 package.json + package-lock.json
 git commit -am "chore: release x.y.z"
 git push -u origin release/x.y.z
 # 2. 开 PR，等 CODEOWNERS approve 后合并
-# 3. 拉最新 master，打 tag 推送
+# 3. 拉最新 main，打 tag 推送
 git checkout main && git pull
 git tag vx.y.z
 git push origin vx.y.z
@@ -76,6 +76,6 @@ git push origin vx.y.z
 ## 约定
 
 - 提交信息用 conventional commits（`feat:` / `fix:` / `chore:` / `ci:`）。
-- master 是保护分支，一切改动走 PR，CODEOWNERS（@deepcoldy @TGGgbone）review。
+- main 是保护分支，一切改动走 PR，CODEOWNERS（@deepcoldy @TGGgbone）review。
 - 运行时密钥/密码不进仓库；VNC 密码由 broker 首次启动随机生成，存
   `ACS_DATA_ROOT/private/`（0600），详见 README "VNC Access Control"。
