@@ -188,6 +188,23 @@ The broker overview and per-session noVNC ports expose browser-session metadata
 and interactive views. Keep ports `9300` and `6090+` on a trusted network or
 restrict them with the host firewall.
 
+## VNC Access Control
+
+Per-session x11vnc no longer runs with `-nopw`: on first start the broker
+generates a random 16-character password and persists it under
+`<ACS_DATA_ROOT>/private/` (`vnc-password.txt` in plain text with mode `0600`,
+plus the `x11vnc -storepasswd` obfuscated file used by `-rfbauth`). The same
+password is reused across restarts; override it with `ACS_VNC_PASSWORD`.
+
+The noVNC URL returned by `browser_session_info` carries the password in the
+URL fragment (`#password=...`), so the viewer connects and authenticates
+without a prompt while the password stays out of server-side access logs.
+Treat the noVNC URL itself as a secret: anyone with the link can view and (in
+Free Browsing / writable mode) control the session desktop.
+
+If `x11vnc -storepasswd` is unavailable, the broker falls back to the
+`-passwd` argument (still authenticated, but visible in the process list).
+
 ## Test Coverage From ACS
 
 The original ACS test scripts are preserved under `test/`:
@@ -196,6 +213,7 @@ The original ACS test scripts are preserved under `test/`:
 - `check-window-map.js`
 - `check-isolation.js`
 - `check-vnc.js`
+- `check-vnc-password.js`
 - `check-puppeteer.js`
 - `check-writable-toggle.js`
 - `check-view-modes.js`

@@ -19,7 +19,7 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const net = require('net');
-const { execSync, spawn } = require('child_process');
+const { execSync, execFileSync, spawn } = require('child_process');
 const WebSocket = require('ws');
 const { CDP, httpGetJson } = require('../lib/cdp');
 
@@ -294,9 +294,69 @@ function allocatePorts() {
   return { slot, vncPort: CFG.vncBase + slot, novncPort: CFG.novncBase + slot };
 }
 
+// VNC 访问控制：默认启用密码认证。
+//  - 密码首次启动时随机生成（16 字符 base64url），持久化到 DATA_ROOT/private/vnc-password.txt（0600）
+//  - 可用 ACS_VNC_PASSWORD 覆盖（不落盘明文以外的形式；仍会写入 vnc-password.txt 以便重启后一致）
+//  - x11vnc 用 -rfbauth 吃混淆后的密码文件；生成失败时退化为 -passwd 明文参数
+//  - noVNC URL 把密码放在 #fragment 里自动填充（fragment 不进服务端日志/访问日志）
+let vncPassword = '';
+let vncPasswdFile = null;
+
+function ensureVncPassword() {
+  const privateDir = path.join(DATA_ROOT, 'private');
+  const plainFile = path.join(privateDir, 'vnc-password.txt');
+  const hashFile = path.join(privateDir, 'vnc-passwd');
+  let passwd = (process.env.ACS_VNC_PASSWORD || '').trim();
+  if (!passwd && fs.existsSync(plainFile)) {
+    passwd = fs.readFileSync(plainFile, 'utf8').trim();
+  }
+  if (!passwd) {
+    passwd = crypto.randomBytes(12).toString('base64url');
+    log('generated new random VNC password');
+  }
+  fs.mkdirSync(privateDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(plainFile, `${passwd}\n`, { mode: 0o600 });
+  try {
+    fs.chmodSync(plainFile, 0o600);
+    execFileSync('x11vnc', ['-storepasswd', passwd, hashFile], { stdio: 'ignore' });
+    fs.chmodSync(hashFile, 0o600);
+    vncPasswdFile = hashFile;
+  } catch (error) {
+    // x11vnc 缺失等场景：退化为 -passwd 明文参数（仍有认证，仅进程列表可见）
+    log('WARN: x11vnc -storepasswd failed, falling back to -passwd:', error.message);
+    vncPasswdFile = null;
+  }
+  vncPassword = passwd;
+}
+
+// broker 异常退出（OOM/SIGKILL）后，per-session x11vnc/websockify 会成为孤儿
+// 并继续占着 591x/609x 端口段，导致新 broker 的 VNC 起不来。启动时先回收。
+function cleanupStaleVncListeners() {
+  let out = '';
+  try { out = execSync('ss -ltnp', { encoding: 'utf8' }); } catch { return; }
+  const pids = new Set();
+  for (const line of out.split('\n')) {
+    const cols = line.trim().split(/\s+/);
+    if (cols.length < 5) continue;
+    const local = cols[3];
+    const port = Number(local.slice(local.lastIndexOf(':') + 1));
+    const inRange = (port >= CFG.vncBase && port <= CFG.vncBase + 40)
+      || (port >= CFG.novncBase && port <= CFG.novncBase + 40);
+    if (!inRange) continue;
+    for (const m of line.matchAll(/pid=(\d+)/g)) pids.add(Number(m[1]));
+  }
+  for (const pid of pids) {
+    try { process.kill(pid, 'SIGTERM'); } catch {}
+  }
+  if (pids.size) log(`cleaned up ${pids.size} stale VNC listener process(es)`);
+}
+
 function x11vncArgs(view) {
   const args = ['-id', String(view.winId), '-display', CFG.display, '-rfbport', String(view.vncPort),
-    '-localhost', '-forever', '-shared', '-nopw', '-noxdamage', '-quiet'];
+    '-localhost', '-forever', '-shared', '-noxdamage', '-quiet'];
+  if (vncPasswdFile) args.push('-rfbauth', vncPasswdFile);
+  else if (vncPassword) args.push('-passwd', vncPassword);
+  else args.push('-nopw');
   if (view.viewonly) args.push('-viewonly');
   return args;
 }
@@ -383,7 +443,8 @@ function startVnc(s, kind, page) {
   ], {
     stdio: ['ignore', fs.openSync(novncLog, 'a'), fs.openSync(novncLog, 'a')],
   });
-  view.novncUrl = `http://${HOST}:${view.novncPort}/vnc.html?autoconnect=true&reconnect=true&reconnect_delay=1000&resize=scale&path=websockify`;
+  const passParam = vncPassword ? `#password=${encodeURIComponent(vncPassword)}` : '';
+  view.novncUrl = `http://${HOST}:${view.novncPort}/vnc.html?autoconnect=true&reconnect=true&reconnect_delay=1000&resize=scale&path=websockify${passParam}`;
   s[`${kind}Vnc`] = view;
   watchNovncProcess(s, kind, view);
   touch(s);
@@ -587,6 +648,10 @@ const LOGICAL_H = parseInt(process.env.ACS_LOGICAL_H || '1117', 10);
 async function mapWindow(cdpWindowId) {
   const physX = 300 + (probeCursor++ % 14) * 200;      // 唯一探针物理 X（间距 200，远大于 ±25 容差）
   const logicalLeft = Math.round(physX / DPR);
+  // 记录所有窗口移动前的位置：多窗口并存时，仅凭"谁在 physX 附近"会错绑到
+  // 恰好停在那里的其他窗口（实测绑到过 about:blank）。必须找"被我们移动过"的那个。
+  const before = new Map();
+  for (const w of acsWindows()) before.set(w, winX(w));
   try {
     await control.send('Browser.setWindowBounds', { windowId: cdpWindowId, bounds: { windowState: 'normal' } });
     await control.send('Browser.setWindowBounds', { windowId: cdpWindowId, bounds: { left: logicalLeft, top: 13, width: 240, height: 200 } });
@@ -594,15 +659,21 @@ async function mapWindow(cdpWindowId) {
 
   let winId = null;
   for (let i = 0; i < 80; i++) {
-    const all = acsWindows().filter((w) => !mappedWindows.has(w)).map((w) => ({ w, x: winX(w) }));
-    const cands = all.filter((c) => c.x !== null && Math.abs(c.x - physX) <= 25);
+    const all = acsWindows().map((w) => ({ w, x: winX(w), prevX: before.has(w) ? before.get(w) : null }));
+    // 首选：位置确实发生变化、且现在落在探针坐标上的窗口
+    const moved = all.filter((c) => c.x !== null && c.prevX !== null && c.prevX !== c.x && Math.abs(c.x - physX) <= 25);
+    if (moved.length >= 1) { winId = moved.sort((a, b) => Math.abs(a.x - physX) - Math.abs(b.x - physX))[0].w; break; }
+    // 兜底：未映射且停在探针坐标上的窗口（首轮轮询前已到位等场景，保持旧行为）
+    const cands = all.filter((c) => !mappedWindows.has(c.w) && c.x !== null && Math.abs(c.x - physX) <= 25);
     if (cands.length >= 1) { winId = cands.sort((a, b) => Math.abs(a.x - physX) - Math.abs(b.x - physX))[0].w; break; }
-    if (process.env.ACS_DEBUG === '1' && i === 40) log('probe miss physX=' + physX, 'unmapped=', JSON.stringify(all.map((c) => c.x)));
+    if (process.env.ACS_DEBUG === '1' && i === 40) log('probe miss physX=' + physX, 'all=', JSON.stringify(all.map((c) => ({ w: c.w, x: c.x, prevX: c.prevX }))));
     await new Promise((r) => setTimeout(r, 30));
   }
-  // kiosk：fullscreen 状态去掉 WM 装饰，内容区精确 = 1728x1117（对齐 16" MBP）
-  try { await control.send('Browser.setWindowBounds', { windowId: cdpWindowId,
-    bounds: { windowState: 'fullscreen' } }); } catch {}
+  // 还原为显式几何（windowState:'fullscreen' 在部分 WM/环境下不生效，窗口会卡在探针尺寸）
+  try {
+    await control.send('Browser.setWindowBounds', { windowId: cdpWindowId,
+      bounds: { windowState: 'normal', left: 0, top: 0, width: LOGICAL_W, height: LOGICAL_H } });
+  } catch {}
   return winId;
 }
 
@@ -1199,7 +1270,9 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 (async () => {
+  cleanupStaleVncListeners();
   await ensureChrome();
+  ensureVncPassword();
   server.listen(CFG.brokerPort, () => log(`listening on :${CFG.brokerPort}  (host ${HOST})`));
 })().catch((e) => { log('fatal', e); process.exit(1); });
 

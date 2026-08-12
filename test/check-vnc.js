@@ -29,7 +29,7 @@ function sh(cmd) {
     try { fs.unlinkSync(f); } catch {}
   }
   console.log(ports);
-  const pass = Boolean(mf && mf.novncUrl && /vnc.html/.test(mf.novncUrl) && ports.includes(String(mf.vncPort)) && ports.includes(String(mf.novncPort)) && shotOk);
+  const pass = Boolean(mf && mf.novncUrl && /vnc.html/.test(mf.novncUrl) && /#password=/.test(mf.novncUrl) && ports.includes(String(mf.vncPort)) && ports.includes(String(mf.novncPort)) && shotOk);
   console.log(pass ? 'PASS: noVNC/x11vnc 就绪且窗口可截图' : 'FAIL');
   cdp.close();
   setTimeout(() => process.exit(pass ? 0 : 1), 500);
