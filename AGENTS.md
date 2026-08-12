@@ -69,7 +69,8 @@ git push origin vx.y.z
 注意：
 
 - tag 名必须是 `v` + 完整版本号（`v0.3.0` ↔ `package.json` 的 `0.3.0`），不一致 CI 会失败。
-- `NPM_TOKEN` secret 由 maintainer 在仓库 Settings → Secrets 维护。
+- 认证走 npm trusted publishing (OIDC)，无需长期 token；npmjs.com 包设置里
+  Trusted Publishers 需指向本仓库 + `.github/workflows/publish.yml`。
 - 发版后 bnpm 等内网镜像同步可能有延迟；验证安装可用
   `npm_config_registry=https://registry.npmjs.org botmux plugin install @botmux-ai/plugin-agent-chrome`。
 

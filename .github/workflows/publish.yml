@@ -1,7 +1,8 @@
 name: publish
 
 # 只在 main 上打 v* tag 时触发，自动发版到 npm。
-# 前置条件：仓库 Settings → Secrets 配置 NPM_TOKEN（有 @botmux-ai 发布权限）。
+# 认证走 npm trusted publishing (OIDC)：npmjs.com 包设置 → Trusted Publishers
+# 添加 GitHub 仓库 botmux-ai/botmux-plugin-agent-chrome + workflow publish.yml。
 on:
   push:
     tags:
@@ -9,6 +10,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write   # npm trusted publishing (OIDC)，免长期 token
 
 jobs:
   publish:
@@ -53,6 +55,6 @@ jobs:
         run: npm test
 
       - name: Publish to npm
-        run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # npm trusted publishing：用 OIDC 换发布凭证，不需要 NPM_TOKEN。
+        # 前置：npmjs.com 包设置 → Trusted Publishers 添加本仓库 + 本 workflow。
+        run: npm publish --access public --provenance
