@@ -1,3 +1,5 @@
+const { ensureAdminToken } = require('../lib/admin-token');
+
 const port = Number(process.env.ACS_BROKER_PORT || 9300);
 
 module.exports = {
@@ -14,7 +16,7 @@ module.exports = {
   },
   urls({ host }) {
     return {
-      openUrl: `http://${host}:${port}/`,
+      openUrl: `http://${host}:${port}/?token=${ensureAdminToken()}`,
       healthUrl: `http://${host}:${port}/health`,
     };
   },

@@ -67,7 +67,12 @@ function initialSidebarCollapsed() {
 }
 
 function brokerUrl(baseUrl, pathname) {
-  const url = new URL(pathname.replace(/^\//, ''), baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`);
+  const base = new URL(baseUrl);
+  const root = `${base.origin}${base.pathname.endsWith('/') ? base.pathname : `${base.pathname}/`}`;
+  const url = new URL(pathname.replace(/^\//, ''), root);
+  // openUrl 携带 broker 管理 token，远程调用 /sessions、/s/* 时需要一起带上。
+  const token = base.searchParams.get('token');
+  if (token) url.searchParams.set('token', token);
   return url.toString();
 }
 
