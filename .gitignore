@@ -8,3 +8,4 @@ profile/
 tmp/
 run/
 logs/
+.dist-previous-*/
