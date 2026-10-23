@@ -71,6 +71,9 @@ git push origin vx.y.z
 - tag 名必须是 `v` + 完整版本号（`v0.3.0` ↔ `package.json` 的 `0.3.0`），不一致 CI 会失败。
 - 认证走 npm trusted publishing (OIDC)，无需长期 token；npmjs.com 包设置里
   Trusted Publishers 需指向本仓库 + `.github/workflows/publish.yml`。
+  前提：发版用的 npm >= 11.5.1（workflow 里会升级），且 `package.json` 的
+  `repository.url` 必须与本 GitHub 仓库完全一致。新建的 trusted publisher
+  配置需在 2 天内完成首次发布，否则失效，建议配置后立即打 tag。
 - 发版后 bnpm 等内网镜像同步可能有延迟；验证安装可用
   `npm_config_registry=https://registry.npmjs.org botmux plugin install @botmux-ai/plugin-agent-chrome`。
 
