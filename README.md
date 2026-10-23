@@ -156,6 +156,19 @@ curl http://127.0.0.1:9300/health
 curl http://127.0.0.1:9300/sessions
 ```
 
+### Remote access
+
+The broker listens on all interfaces, but only local processes (loopback, no
+`Origin` header) are trusted. Remote or browser requests to the dashboard,
+`/sessions` and `/s/*` need `?token=<admin token>`; the token is generated in
+`~/.agent-chrome/admin-token` (override with `ACS_ADMIN_TOKEN_FILE` or
+`ACS_ADMIN_TOKEN`). CDP WebSockets are never accepted remotely.
+
+noVNC links stay protected by the VNC password (see "VNC Access Control") and
+don't contain the admin token, so sharing one doesn't expose the dashboard or
+browser control. Before this gate, `/sessions` handed out every noVNC URL
+(password included) and session token to anyone who could reach the port.
+
 The Agent Chrome MCP adds two session-scoped tools alongside the standard Chrome
 DevTools tools:
 
