@@ -1,7 +1,11 @@
 {
   "name": "@botmux-ai/plugin-agent-chrome",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Agent Chrome Stack plugin for botmux.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/botmux-ai/botmux-plugin-agent-chrome.git"
+  },
   "type": "commonjs",
   "keywords": [
     "botmux-plugin"
