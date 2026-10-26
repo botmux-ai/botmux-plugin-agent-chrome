@@ -19,6 +19,7 @@ Chrome instance, per-session CDP isolation, and per-session noVNC views
 | `bin/broker.js` | L3 broker 源码（CDP 隔离、窗口映射、per-session VNC）。esbuild 打包进 `dist/`，**直接改这个文件** |
 | `bin/*.sh` | L1 显示层 / L2 Chrome / 启停脚本 |
 | `lib/cdp.js` | CDP 连接辅助 |
+| `lib/admin-token.js` | broker 管理 token（远程访问 Dashboard / `/sessions` / `/s/*` 需带 `?token=`） |
 | `src/mcp/` | MCP server（对 agent 暴露的工具） |
 | `service/` | botmux 插件 service runner（拉起 broker、健康检查） |
 | `dashboard/` | 插件面板（React，esbuild 打包） |

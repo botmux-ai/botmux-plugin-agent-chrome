@@ -2,7 +2,7 @@
 
 const { createServer } = require('node:http');
 const { spawn } = require('node:child_process');
-const { mkdtempSync, rmSync } = require('node:fs');
+const { mkdtempSync, readFileSync, rmSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const { join, resolve } = require('node:path');
 const WebSocket = require('ws');
@@ -52,9 +52,9 @@ async function stopProcess(child) {
   });
 }
 
-function expectWebSocketRejected(url) {
+function expectWebSocketRejected(url, options) {
   return new Promise(resolvePromise => {
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(url, options);
     let opened = false;
     let settled = false;
     const finish = rejected => {
@@ -118,6 +118,7 @@ async function main() {
       ACS_CHROME_PORT: String(chromePort),
       ACS_BROKER_PORT: String(brokerPort),
       ACS_RECONNECT_GRACE_MS: '250',
+      ACS_ADMIN_TOKEN_FILE: join(temp, 'admin-token'),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -150,6 +151,25 @@ async function main() {
     assert(secondManifest.token === 'transport-a', 'reconnect must preserve the original random access token');
     const sessions = await (await fetch(`${base}/sessions`)).json();
     assert(sessions.length === 1, `reconnect created duplicate sessions: ${sessions.length}`);
+
+    // 带 Origin 视为浏览器/远程访问：除 /health 外都要管理 token，CDP 一律拒绝。
+    const browserHeaders = { origin: 'http://example.test' };
+    const adminToken = readFileSync(join(temp, 'admin-token'), 'utf8').trim();
+    assert((await fetch(`${base}/health`, { headers: browserHeaders })).ok, '/health must stay public');
+    assert((await fetch(`${base}/sessions`, { headers: browserHeaders })).status === 401,
+      'remote /sessions without admin token must be rejected');
+    assert((await fetch(`${base}/sessions?token=wrong`, { headers: browserHeaders })).status === 401,
+      'remote /sessions with a wrong admin token must be rejected');
+    assert((await fetch(`${base}/s/transport-a/manifest`, { headers: browserHeaders })).status === 401,
+      'remote session routes without admin token must be rejected');
+    assert((await fetch(`${base}/sessions?token=${adminToken}`, { headers: browserHeaders })).ok,
+      'remote /sessions with admin token must be allowed');
+    assert((await fetch(`${base}/s/transport-a/manifest?token=${adminToken}`, { headers: browserHeaders })).ok,
+      'remote session routes with admin token must be allowed');
+    assert(await expectWebSocketRejected(
+      `ws://127.0.0.1:${brokerPort}/s/transport-a/devtools/browser/remote?token=${adminToken}`,
+      { headers: browserHeaders }),
+    'browser-originated CDP WebSocket must be rejected even with admin token');
 
     const rebound = await bind('transport-a', 'botmux-session-b');
     assert(rebound.status === 400, 'one transport must not rebind to a different session');

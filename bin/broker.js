@@ -22,6 +22,7 @@ const net = require('net');
 const { execSync, execFileSync, spawn } = require('child_process');
 const WebSocket = require('ws');
 const { CDP, httpGetJson } = require('../lib/cdp');
+const { adminTokenFile, ensureAdminToken, adminTokenMatches } = require('../lib/admin-token');
 
 const DATA_ROOT = process.env.ACS_DATA_ROOT
   || process.env.AGENT_CHROME_HOME
@@ -40,6 +41,7 @@ const CFG = {
 
 fs.mkdirSync(CFG.manifests, { recursive: true });
 fs.mkdirSync(CFG.logs, { recursive: true });
+const ADMIN_TOKEN = ensureAdminToken();
 
 function log(...a) { console.log(new Date().toISOString(), '[broker]', ...a); }
 function xdo(cmd) { return execSync(`DISPLAY=${CFG.display} ${cmd}`, { encoding: 'utf8' }).trim(); }
@@ -1125,6 +1127,18 @@ function readJsonBody(req) {
   });
 }
 
+// 本机进程（MCP、browser-session、acs-up）直连 127.0.0.1 且不带 Origin；
+// 带 Origin 的是浏览器页面（包括 Agent 自己 Chrome 里打开的网页），不能因为来自本机就信任。
+function isTrustedLocal(req) {
+  const addr = req.socket.remoteAddress || '';
+  const loopback = addr === '127.0.0.1' || addr === '::1' || addr.startsWith('::ffff:127.');
+  return loopback && !req.headers.origin;
+}
+
+function isAuthorizedHttp(req, u) {
+  return isTrustedLocal(req) || adminTokenMatches(ADMIN_TOKEN, u.query.token);
+}
+
 // ---------------- HTTP + WS 服务 ----------------
 const server = http.createServer(async (req, res) => {
   const u = url.parse(req.url, true);
@@ -1132,6 +1146,10 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') {
     res.statusCode = 204;
     res.end();
+    return;
+  }
+  if (u.pathname !== '/health' && !isAuthorizedHttp(req, u)) {
+    jsonResponse(res, 401, { error: 'unauthorized' });
     return;
   }
   // 冒充 chrome：/s/<token>/json/version
@@ -1241,6 +1259,8 @@ const server = http.createServer(async (req, res) => {
 
 const wss = new WebSocket.Server({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
+  // CDP 等于整个带登录态的 Chrome，只给本机进程用，管理 token 也不放行。
+  if (!isTrustedLocal(req)) { socket.destroy(); return; }
   const parsed = url.parse(req.url, true);
   const m = parsed.pathname.match(/^\/s\/([^/]+)\/devtools\//);
   if (!m) { socket.destroy(); return; }
@@ -1273,7 +1293,7 @@ server.on('upgrade', (req, socket, head) => {
   cleanupStaleVncListeners();
   await ensureChrome();
   ensureVncPassword();
-  server.listen(CFG.brokerPort, () => log(`listening on :${CFG.brokerPort}  (host ${HOST})`));
+  server.listen(CFG.brokerPort, () => log(`listening on :${CFG.brokerPort}  (host ${HOST}, remote access needs ?token= from ${adminTokenFile()})`));
 })().catch((e) => { log('fatal', e); process.exit(1); });
 
 process.on('SIGTERM', () => { for (const t of [...sessions.keys()]) teardown(t); process.exit(0); });

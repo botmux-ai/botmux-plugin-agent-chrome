@@ -102,6 +102,7 @@ async function startBroker(chromePort, brokerPort, extraEnv = {}) {
       ACS_RUN: join(temp, 'run'),
       ACS_MANIFESTS: join(temp, 'run', 'manifests'),
       ACS_LOGS: join(temp, 'logs'),
+      ACS_ADMIN_TOKEN_FILE: join(temp, 'admin-token'),
       ACS_CHROME_PORT: String(chromePort),
       ACS_BROKER_PORT: String(brokerPort),
       ACS_RECONNECT_GRACE_MS: '250',

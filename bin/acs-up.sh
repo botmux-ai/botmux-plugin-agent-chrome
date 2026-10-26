@@ -50,5 +50,6 @@ fi
 echo "=== ACS stack ready ==="
 echo "  display : $ACS_DISPLAY (${ACS_SCREEN_W}x${ACS_SCREEN_H}, DPR$ACS_DPR → ${ACS_LOGICAL_W}x${ACS_LOGICAL_H})"
 echo "  chrome  : 127.0.0.1:${ACS_CHROME_PORT} (仅本地)"
-echo "  broker  : http://127.0.0.1:${ACS_BROKER_PORT}  总览 http://$(hostname -I 2>/dev/null | awk '{print $1}'):${ACS_BROKER_PORT}/"
+ACS_ADMIN_TOKEN_VALUE="${ACS_ADMIN_TOKEN:-$(cat "${ACS_ADMIN_TOKEN_FILE:-$HOME/.agent-chrome/admin-token}" 2>/dev/null)}"
+echo "  broker  : http://127.0.0.1:${ACS_BROKER_PORT}  总览 http://$(hostname -I 2>/dev/null | awk '{print $1}'):${ACS_BROKER_PORT}/?token=${ACS_ADMIN_TOKEN_VALUE}"
 echo "  接入    : MCP 用 --wsEndpoint=ws://127.0.0.1:${ACS_BROKER_PORT}/s/<token>/devtools/browser/x （或经 bin/mcp-launch.sh 自动分配）"
